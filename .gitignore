@@ -1,0 +1,22 @@
+# 빌드 결과물 / 배포 파일
+build/
+dist/
+release/
+*.spec
+
+# 대용량 바이너리 (ffmpeg는 별도로 받아서 ffmpeg_bin/ 에 넣음)
+ffmpeg_bin/
+ffmpeg/
+
+# 다운로드 결과, 개인 설정, 런타임 파일
+download/
+config.json
+archive.txt
+yt_dlp_update/
+
+# Python
+__pycache__/
+*.pyc
+
+# Claude Code 로컬 설정
+.claude/

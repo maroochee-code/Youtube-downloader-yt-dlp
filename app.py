@@ -36,7 +36,7 @@ STATIC = RES_DIR / "static"
 CONFIG = APP_DIR / "config.json"
 ARCHIVE = APP_DIR / "archive.txt"
 DEFAULT_DIR = (str(Path.home() / "Downloads" / "YT다운로더") if FROZEN
-               else r"D:\CusomProjectClaudCode\ytdlp\download")
+               else str(APP_DIR / "download"))
 
 DEFAULTS = {
     "download_dir": DEFAULT_DIR,

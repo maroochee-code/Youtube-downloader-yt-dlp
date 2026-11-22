@@ -538,11 +538,10 @@ const Editor = (() => {
     say(miss.length ? `원본 파일을 찾을 수 없습니다: ${miss.map(nameOf).join(', ')}` : `열었습니다: ${P.name}`, !!miss.length);
   }
 
-  /* 확대/축소: 재생선(또는 마우스 위치)이 화면에서 움직이지 않게 기준점을 잡는다 */
+  /* 확대/축소: 슬라이더는 화면 왼쪽 끝의 시간을 기준으로(왼쪽에서 오른쪽으로 늘어남), Ctrl+휠은 마우스 위치를 기준으로 */
   function setZoom(np, anchorX) {
     const sc = R.scroll, sr = sc.getBoundingClientRect(), old = pps;
-    let ax = anchorX ?? sr.left + OFF + (T * old - sc.scrollLeft);
-    if (anchorX === undefined && (ax < sr.left + OFF || ax > sr.right)) ax = sr.left + OFF + (sr.width - OFF) / 2;   // 재생선이 화면 밖이면 가운데 기준
+    const ax = anchorX ?? sr.left + OFF;
     const t = (ax - sr.left + sc.scrollLeft - OFF) / old;
     pps = Math.round(np * 100) / 100;
     const z = $('#edZoom'); if (z && +z.value !== Math.round(pps)) z.value = Math.round(pps);

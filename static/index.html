@@ -428,7 +428,7 @@ $('#mSites').onclick = async () => {
 };
 $('#siteQ').oninput = () => sitesData && renderSites();
 $('#mFolder').onclick = () => api('/api/open-folder', {});
-$('#mAbout').onclick = async () => { const a = await api('/api/about'); msg(`yt-dlp ${a.yt_dlp} · ffmpeg ${a.ffmpeg ? '사용 가능' : '없음 (병합·변환 불가)'}`); };
+$('#mAbout').onclick = async () => { const a = await api('/api/about'); msg(`YT 다운로더 v${a.app} · yt-dlp ${a.yt_dlp} · ffmpeg ${a.ffmpeg ? '사용 가능' : '없음 (병합·변환 불가)'}`); };
 function updBar(html, binds) {
   const b = $('#upd'); b.style.display = html ? 'flex' : 'none'; b.innerHTML = html || '';
   for (const [id, fn] of Object.entries(binds || {})) { const el = document.getElementById(id); if (el) el.onclick = fn; }

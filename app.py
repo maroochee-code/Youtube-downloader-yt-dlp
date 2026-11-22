@@ -18,6 +18,7 @@ import webbrowser
 import zipfile
 from pathlib import Path
 
+APP_VERSION = "1.4.2"  # 편집 기능 포함 버전 (CHANGELOG.md 참고)
 FROZEN = getattr(sys, "frozen", False)  # PyInstaller exe 로 실행 중인지
 APP_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent  # 쓰기 가능한 위치
 RES_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))  # 번들된 리소스(static) 위치
@@ -417,7 +418,7 @@ def api_extractors():
 
 @app.get("/api/about")
 def api_about():
-    return {"yt_dlp": yt_dlp.version.__version__, "ffmpeg": bool(shutil.which("ffmpeg") or (APP_DIR / "ffmpeg").exists())}
+    return {"app": APP_VERSION, "yt_dlp": yt_dlp.version.__version__, "ffmpeg": bool(shutil.which("ffmpeg") or (APP_DIR / "ffmpeg").exists())}
 
 
 def ver_key(v: str) -> tuple:

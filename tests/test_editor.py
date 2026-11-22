@@ -250,3 +250,54 @@ def test_waveform_api(media, tmp_path):
     r = client.get("/api/edit/wave", params={"src": "music.wav"}).json()
     assert r["rate"] == 20 and 110 <= len(r["peaks"]) <= 125 and max(r["peaks"]) > 10
     assert client.get("/api/edit/wave", params={"src": "nope.wav"}).status_code == 400
+
+
+# ---------- v1.2: 이미지 / 도형 / 더킹 / 평준화 ----------
+@pytest.fixture(scope="module")
+def pics(media):
+    run("-f", "lavfi", "-i", "color=c=red:s=300x200:d=1", "-frames:v", 1, media / "red.png")
+    run("-f", "lavfi", "-i", "color=c=blue:s=200x200:d=1", "-frames:v", 1, media / "blue.jpg")
+    return media
+
+
+def mean_color(video: Path, t: float, tmp: Path, crop: str) -> tuple[int, int, int]:
+    png = tmp / f"px_{t}_{abs(hash(crop))}.png"
+    run("-ss", t, "-i", video, "-vf", f"crop={crop},scale=1:1", "-frames:v", 1, png)
+    raw = subprocess.run([FFMPEG, "-v", "error", "-i", png, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                         capture_output=True, check=True).stdout
+    return raw[0], raw[1], raw[2]
+
+
+def test_probe_marks_images(pics):
+    assert ffprobe_of(pics / "red.png")["is_image"] is True
+    assert ffprobe_of(pics / "a.mp4")["is_image"] is False
+
+
+def test_image_slideshow_and_solid(pics, tmp_path):
+    out = export(pics, tmp_path, {"name": "slides", "version": 2, "output": {"aspect": "16:9"}, "clips": [
+        {"src": "red.png", "image": True, "track": 0, "start": 0, "hold": 2},
+        {"src": "blue.jpg", "image": True, "track": 0, "start": 2, "hold": 2},
+        {"solid": {"shape": "rect", "color": "#00ff00", "w": 0.2, "h": 0.2}, "track": 1, "start": 0.5, "hold": 1,
+         "x": 0.1, "y": 0.1},
+        {"solid": {"shape": "ellipse", "color": "#ffff00", "w": 0.3, "h": 0.3}, "track": 1, "start": 2.5, "hold": 1}]})
+    info = ffprobe_of(out)
+    assert info["duration"] == pytest.approx(4.0, abs=0.3) and (info["width"], info["height"]) == (1920, 1080)
+    r, g, b = mean_color(out, 1.0, tmp_path, "400:300:900:400")      # 가운데 = 빨강 이미지
+    assert r > 200 and g < 60 and b < 60
+    r, g, b = mean_color(out, 3.5, tmp_path, "100:100:900:400")     # 파랑 이미지
+    assert b > 200 and r < 60
+    r, g, b = mean_color(out, 1.0, tmp_path, "100:100:100:70")      # 왼쪽 위 초록 사각형
+    assert g > 200 and r < 60
+
+
+def test_duck_and_loudnorm(media, tmp_path):
+    p = {"name": "duck", "version": 2, "output": {"loudnorm": True}, "clips": [
+        {"src": "a.mp4", "track": 0, "start": 0, "in": 0, "out": 2}, {"src": "silent.mp4", "track": 0, "start": 2, "in": 0, "out": 2}],
+         "audios": [{"src": "music.wav", "track": 0, "start": 0, "in": 0, "out": 4, "duck": True, "duck_level": 0.2}]}
+    plan = editor.build_plan(p, lambda s: media / s, ffprobe_of)
+    assert "eval=frame" in plan["graph"] and "loudnorm" in plan["graph"]
+    out = export(media, tmp_path, p)
+    assert ffprobe_of(out)["has_audio"]
+    assert editor.merge_spans([(0, 1), (1.2, 2), (5, 6)]) == [(0, 2), (5, 6)]
+    spans = [(i * 3.0, i * 3.0 + 1) for i in range(100)]
+    assert len(editor.merge_spans(spans)) <= editor.DUCK_MAX_SPANS

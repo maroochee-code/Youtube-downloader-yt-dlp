@@ -22,6 +22,7 @@ CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 ASPECTS = {"16:9": (1920, 1080), "9:16": (1080, 1920), "1:1": (1080, 1080)}
 SUB_POS = {"bottom": 2, "middle": 5, "top": 8}  # ASS 정렬 번호
 FONT_FILES = ("malgun.ttf", "malgunbd.ttf")  # 윈도우 기본 한글 폰트(맑은 고딕)
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
 BAD_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 
@@ -58,6 +59,7 @@ def probe(path: Path, app_dir: Path) -> dict:
         a, _, b = vs["avg_frame_rate"].partition("/")
         fps = float(a) / float(b) if float(b or 0) else 0.0
     return {"duration": round(dur, 3), "has_video": bool(vs), "has_audio": has_audio,
+            "is_image": path.suffix.lower() in IMAGE_EXT and bool(vs),
             "width": int((vs or {}).get("width") or 0), "height": int((vs or {}).get("height") or 0),
             "fps": round(fps, 3)}
 
@@ -155,11 +157,19 @@ def normalize(project: dict) -> dict:
     vmax = amax = 0
     for c in project.get("clips") or []:
         src = str(c.get("src") or "")
-        if not src:
+        sd = c.get("solid") if isinstance(c.get("solid"), dict) else None
+        if not src and not sd:
             continue
         track = int(_num(c.get("track"), 0, 0, MAX_TRACKS - 1))
         vmax = max(vmax, track)
-        freeze = bool(c.get("freeze"))
+        solid = None
+        if sd:
+            solid = {"shape": sd.get("shape") if sd.get("shape") in ("rect", "ellipse") else "rect",
+                     "color": _color(sd.get("color"), "#000000"),
+                     "w": _num(sd.get("w"), 1, 0.01, 1), "h": _num(sd.get("h"), 1, 0.01, 1)}
+            src = ""
+        image = bool(c.get("image")) and not solid
+        freeze = bool(c.get("freeze")) or image or bool(solid)
         cin = _num(c.get("in"), 0, 0, 1e6)
         cout = _num(c.get("out"), cin + 1, 0, 1e6)
         if freeze:
@@ -176,7 +186,8 @@ def normalize(project: dict) -> dict:
             "scale": _num(c.get("scale"), 1, 0.05, 5), "opacity": _num(c.get("opacity"), 1, 0, 1),
             "fade_in": _num(c.get("fade_in"), 0, 0, 60), "fade_out": _num(c.get("fade_out"), 0, 0, 60),
             "trans": {"type": ttype} if ttype in TRANS_TYPES else None,
-            "freeze": freeze, "hold": _num(c.get("hold"), 2, 0.1, 600), "link": c.get("link") or None})
+            "freeze": freeze, "image": image, "solid": solid, "hold": _num(c.get("hold"), 2, 0.1, 3600),
+            "link": c.get("link") or None})
     if not out["clips"]:
         raise EditError("타임라인에 영상이 없습니다. 왼쪽 목록에서 영상을 추가하세요.")
     for a in project.get("audios") or []:
@@ -193,6 +204,7 @@ def normalize(project: dict) -> dict:
                               "speed": _num(a.get("speed"), 1, 0.25, 4),
                               "volume": _num(a.get("volume"), 1, 0, 4),
                               "fade_in": _num(a.get("fade_in"), 0, 0, 60), "fade_out": _num(a.get("fade_out"), 0, 0, 60),
+                              "duck": bool(a.get("duck")), "duck_level": _num(a.get("duck_level"), 0.25, 0, 1),
                               "link": a.get("link") or None})
     out["tracks"] = {"v": _tracks(raw_tr.get("v"), vmax + 1), "a": _tracks(raw_tr.get("a"), amax + 1)}
     for s in project.get("subs") or []:
@@ -214,7 +226,8 @@ def normalize(project: dict) -> dict:
     out["sub_style"] = {"size": _num(ss.get("size"), 48, 10, 200), "color": _color(ss.get("color"), "#ffffff"),
                         "outline": _color(ss.get("outline"), "#000000"), "pos": pos}
     o = project.get("output") or {}
-    out["output"] = {"aspect": o.get("aspect") if o.get("aspect") in ASPECTS else "original"}
+    out["output"] = {"aspect": o.get("aspect") if o.get("aspect") in ASPECTS else "original",
+                     "loudnorm": bool(o.get("loudnorm"))}
     return out
 
 
@@ -364,6 +377,47 @@ def _slide(kind: str, W: int, H: int, start: float, ov: float) -> tuple[str, str
             "slide-u": ("", f"+{H}*{prog}"), "slide-d": ("", f"-{H}*{prog}")}[kind]
 
 
+DUCK_RAMP = 0.25      # 배경음악이 작아지고 커지는 데 걸리는 시간(초)
+DUCK_MAX_SPANS = 60   # 식이 너무 길어지지 않게 말하는 구간은 최대 60개로 합친다
+
+
+def voice_intervals(p: dict, infos: dict) -> list[tuple[float, float]]:
+    """오디오 더킹 기준: 소리가 나는 영상 클립과 더킹이 아닌 오디오가 재생되는 구간."""
+    spans = []
+    for c in p["clips"]:
+        if not (c["freeze"] or c["mute"] or p["tracks"]["v"][c["track"]]["mute"])                 and infos.get(c["src"], {}).get("has_audio"):
+            spans.append((c["start"], c["start"] + clip_duration(c)))
+    for a in p["audios"]:
+        if not a["duck"] and not p["tracks"]["a"][a["track"]]["mute"] and a["src"] in infos:
+            end = a["out"] if a["out"] else infos[a["src"]]["duration"]
+            spans.append((a["start"], a["start"] + max(0.05, end - a["in"]) / a["speed"]))
+    return merge_spans(spans)
+
+
+def merge_spans(spans: list[tuple[float, float]], gap: float = 2 * DUCK_RAMP) -> list[tuple[float, float]]:
+    out: list[list[float]] = []
+    for s, e in sorted(spans):
+        if out and s - out[-1][1] < gap:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    while len(out) > DUCK_MAX_SPANS:
+        i = min(range(len(out) - 1), key=lambda k: out[k + 1][0] - out[k][1])
+        out[i][1] = out[i + 1][1]
+        del out[i + 1]
+    return [(s, e) for s, e in out]
+
+
+def duck_expr(spans: list[tuple[float, float]], level: float) -> str:
+    """시간 t 에서의 음량 배율: 말하는 구간이면 level, 앞뒤 DUCK_RAMP 초 동안 서서히 변한다."""
+    r = DUCK_RAMP
+    terms = [f"clip(min((t-{s - r:.3f})/{r},({e + r:.3f}-t)/{r}),0,1)" for s, e in spans]
+    acc = terms[0]
+    for t in terms[1:]:
+        acc = f"max({acc},{t})"
+    return f"1-{1 - level:.3f}*{acc}"
+
+
 def build_plan(project: dict, resolve, probe_fn) -> dict:
     """편집 목록 -> {graph, inputs, size, duration, ass}. resolve(src)->Path, probe_fn(Path)->dict.
 
@@ -383,6 +437,8 @@ def build_plan(project: dict, resolve, probe_fn) -> dict:
         return index[src]
 
     for c in p["clips"]:
+        if c["solid"]:
+            continue
         use(c["src"])
         info = infos[c["src"]]
         if not info["has_video"]:
@@ -394,7 +450,8 @@ def build_plan(project: dict, resolve, probe_fn) -> dict:
             c["out"] = min(c["out"], info["duration"] or c["out"])
             if c["out"] - c["in"] < 0.05:
                 raise EditError("자른 구간이 영상 길이를 벗어났습니다.")
-    first = infos[min(p["clips"], key=lambda c: c["start"])["src"]]
+    media = sorted((c for c in p["clips"] if not c["solid"]), key=lambda c: c["start"])
+    first = next((infos[c["src"]] for c in media if not infos[c["src"]].get("is_image")), None)         or (infos[media[0]["src"]] if media else {"width": 0, "height": 0, "fps": 30})
     asp = p["output"]["aspect"]
     if asp in ASPECTS:
         w, h = ASPECTS[asp]
@@ -408,16 +465,25 @@ def build_plan(project: dict, resolve, probe_fn) -> dict:
     last = "b0"
     layers = sorted((c for c in p["clips"] if not vtr[c["track"]]["hide"]), key=lambda c: (c["track"], c["start"]))
     for n, c in enumerate(layers):
-        i, cd = index[c["src"]], clip_duration(c)
+        cd = clip_duration(c)
+        i = index.get(c["src"])
         ov_in, ttype = overlap_in(p, c), (c["trans"] or {}).get("type")
-        if c["freeze"]:
+        sw, sh = max(2, round(w * c["scale"] / 2) * 2), max(2, round(h * c["scale"] / 2) * 2)
+        if c["solid"]:
+            sd = c["solid"]
+            sw, sh = max(2, round(w * sd["w"] * c["scale"] / 2) * 2), max(2, round(h * sd["h"] * c["scale"] / 2) * 2)
+            f = f"color=c=0x{sd['color'][1:]}:s={sw}x{sh}:r={fps}:d={cd:.3f},format=yuva420p"
+            if sd["shape"] == "ellipse":
+                f += (",geq=lum='p(X,Y)':cb='p(X,Y)':cr='p(X,Y)':"
+                      "a='if(lte(pow((X-W/2)/(W/2),2)+pow((Y-H/2)/(H/2),2),1),255,0)'")
+        elif c["freeze"]:
             f = (f"[{i}:v]trim=start={c['in']:.3f}:end={c['in'] + 1:.3f},setpts=PTS-STARTPTS,select='eq(n,0)',"
                  f"tpad=stop_mode=clone:stop_duration={c['hold']:.3f},trim=duration={cd:.3f},setpts=PTS-STARTPTS")
         else:
             f = (f"[{i}:v]trim=start={c['in']:.3f}:end={c['out']:.3f},"
                  f"setpts=(PTS-STARTPTS)/{c['speed']:.5f}")
-        sw, sh = max(2, round(w * c["scale"] / 2) * 2), max(2, round(h * c["scale"] / 2) * 2)
-        f += f",fps={fps},scale={sw}:{sh}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1"
+        if not c["solid"]:
+            f += f",fps={fps},scale={sw}:{sh}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1"
         fin = ov_in if ttype == "fade" and ov_in > 0 else c["fade_in"]
         fout = c["fade_out"]
         fades = []
@@ -425,7 +491,7 @@ def build_plan(project: dict, resolve, probe_fn) -> dict:
             fades.append(f"fade=t=in:st=0:d={min(fin, cd):.3f}:alpha=1")
         if fout > 0:
             fades.append(f"fade=t=out:st={max(0.0, cd - fout):.3f}:d={min(fout, cd):.3f}:alpha=1")
-        if fades or c["opacity"] < 0.999:
+        if fades or c["opacity"] < 0.999 or c["image"] or c["solid"]:
             f += ",format=yuva420p" + "".join("," + x for x in fades)
             if c["opacity"] < 0.999:
                 f += f",format=rgba,colorchannelmixer=aa={c['opacity']:.3f}"
@@ -446,17 +512,22 @@ def build_plan(project: dict, resolve, probe_fn) -> dict:
     g.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={dur:.3f},asetpts=PTS-STARTPTS[ab]")
     mixin = ["[ab]"]
 
-    def tail(f: str, start: float, k: int) -> None:
+    for a in p["audios"]:
+        use(a["src"])
+    voices = voice_intervals(p, infos)
+
+    def tail(f: str, start: float, k: int, duck: dict | None = None) -> None:
         f += f",{AFMT}"
         if start > 0:
             f += f",adelay={round(start * 1000)}:all=1"
+        if duck and voices:
+            f += f",volume='{duck_expr(voices, duck['duck_level'])}':eval=frame"
         g.append(f"{f}[m{k}]")
         mixin.append(f"[m{k}]")
 
     k = 0
     for c in p["clips"]:
-        info = infos[c["src"]]
-        if c["freeze"] or c["mute"] or not info["has_audio"] or atr_muted(vtr, c["track"]):
+        if c["freeze"] or c["mute"] or not infos[c["src"]]["has_audio"] or atr_muted(vtr, c["track"]):
             continue
         cd = clip_duration(c)
         tempo = atempo_chain(c["speed"])
@@ -487,10 +558,13 @@ def build_plan(project: dict, resolve, probe_fn) -> dict:
         if a["fade_out"]:
             fo = min(a["fade_out"], ad)
             f += f",afade=t=out:st={ad - fo:.3f}:d={fo:.3f}"
-        tail(f, a["start"], k)
+        tail(f, a["start"], k, a if a["duck"] else None)
         k += 1
     if k:
-        g.append("".join(mixin) + f"amix=inputs={len(mixin)}:duration=first:normalize=0,alimiter=limit=0.95[am]")
+        mix = "".join(mixin) + f"amix=inputs={len(mixin)}:duration=first:normalize=0,alimiter=limit=0.95"
+        if p["output"]["loudnorm"]:
+            mix += ",loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000,aformat=channel_layouts=stereo"
+        g.append(mix + "[am]")
         amap = "[am]"
     else:
         amap = "[ab]"

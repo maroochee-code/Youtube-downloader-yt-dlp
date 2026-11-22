@@ -32,7 +32,7 @@
 .ed-center{display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--bg)}
 .ed-wrap{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;padding:10px}
 #edStage{position:relative;background:#000;overflow:hidden;border-radius:4px;flex:none;--k:.4}
-#edStage video.lyr{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:transparent;transform-origin:center center}
+#edStage .lyr{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:transparent;transform-origin:center center;pointer-events:none;user-select:none}
 #edStage .empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#888;font-size:13px;text-align:center;padding:20px}
 #edOv{position:absolute;inset:0;pointer-events:none}
 #edOv .sub{position:absolute;left:5%;right:5%;text-align:center;color:#fff;font-weight:700;line-height:1.25;white-space:pre-wrap;text-shadow:0 0 calc(var(--k)*3px) #000,0 0 calc(var(--k)*3px) #000,0 0 calc(var(--k)*3px) #000}
@@ -90,4 +90,18 @@
 .rb{position:absolute;border:1px solid var(--accent);background:rgba(80,140,255,.15);z-index:10;pointer-events:none}
 .ed-tools .tg.on{background:var(--soft);color:var(--accent);font-weight:600}
 .ed-tools{flex-wrap:wrap}
+#edStage .lyr.solid{inset:auto;width:auto;height:auto}
+.ed-ctl{flex-wrap:wrap}
+.ed-ctl .sep{width:1px;height:18px;background:var(--line);margin:0 4px}
+.ed-ctl input{padding:3px 6px;font-size:12px}
+.ed-ctl .tg.on,.ed-lbody .rec{background:var(--soft);color:var(--accent);font-weight:600}
+.ed-lbody .rec{color:#fff;background:#c0392b}
+.ruler .rng{position:absolute;top:0;bottom:0;background:rgba(80,140,255,.22);border-left:2px solid var(--accent);border-right:2px solid var(--accent);pointer-events:none}
+.ruler .rng.on{background:rgba(80,200,120,.28);border-color:#3bb36b}
+.ruler i.mk{position:absolute;top:0;font-style:normal;font-size:11px;color:#ffb020;cursor:pointer;z-index:4;line-height:22px;white-space:nowrap}
+.ruler i.mk em{font-style:normal;font-size:10px;margin-left:1px;color:var(--sub)}
+.mkrow{display:flex;gap:4px;align-items:center;margin:4px 0}
+.mkrow input{flex:1;min-width:0;padding:2px 6px;font-size:12px}
+.mkrow button{padding:2px 6px;font-size:11px}
+.blk.clip.solid{background:#7a5fb0}
 @media (max-width:1000px){.ed-main{grid-template-columns:220px minmax(0,1fr)}.ed-right{display:none}}

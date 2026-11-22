@@ -90,7 +90,7 @@ def clean(msg: str) -> str:
 
 def check_url(url: str) -> str:
     url = (url or "").strip()
-    if not re.match(r"^https?://", url, re.I):
+    if not re.match(r"^https?://", url, re.IGNORECASE):
         raise HTTPException(400, "http:// 또는 https:// 로 시작하는 주소를 입력하세요.")
     return url
 
@@ -137,7 +137,7 @@ def api_info(req: InfoReq):
     try:
         with yt_dlp.YoutubeDL(opts) as y:
             d = y.extract_info(url, download=False)
-    except Exception as e:  # yt-dlp 오류는 종류가 다양함
+    except Exception as e:  # noqa: BLE001 - yt-dlp 오류는 종류가 다양함
         raise HTTPException(400, clean(str(e)))
     if not d:
         raise HTTPException(400, "정보를 가져오지 못했습니다.")
@@ -260,7 +260,7 @@ def run_job(jid: str, url: str, args: list[str]) -> None:
             job.update(status="done", percent=100, speed=None, eta=None)
         except yt_dlp.utils.DownloadCancelled:
             job.update(status="cancelled")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - 어떤 오류든 작업 상태에 표시
             job.update(status="error", error=clean(str(e)))
         finally:
             job["finished"] = time.time()
@@ -352,10 +352,11 @@ def api_pick_folder():
             out = r[0] if r else ""
         elif not FROZEN:
             code = ("import tkinter as tk\nfrom tkinter import filedialog\nr=tk.Tk();r.withdraw();"
-                    "r.attributes('-topmost',True)\nprint(filedialog.askdirectory(initialdir=%r) or '')"
-                    % str(media_dir()))
-            out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True).stdout.strip()
-    except Exception as e:
+                    "r.attributes('-topmost',True)\n"
+                    f"print(filedialog.askdirectory(initialdir={str(media_dir())!r}) or '')")
+            out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                                 check=False).stdout.strip()
+    except Exception as e:  # noqa: BLE001 - pywebview/tkinter 오류 종류가 다양함
         raise HTTPException(500, f"폴더 선택 창을 열지 못했습니다: {e}")
     if out:
         s = get_settings()
@@ -447,7 +448,7 @@ def api_update_check():
     try:
         with urllib.request.urlopen("https://pypi.org/pypi/yt-dlp/json", timeout=6) as r:
             latest = json.load(r)["info"]["version"]
-    except Exception:  # 오프라인 등
+    except Exception:  # noqa: BLE001 - 오프라인 등
         return {"current": cur, "latest": None, "outdated": False}
     return {"current": cur, "latest": latest, "outdated": ver_key(latest) > ver_key(cur)}
 
@@ -459,10 +460,10 @@ def api_update():
     if FROZEN:  # exe 에는 pip 이 없으므로 PyPI 의 wheel 을 받아 yt_dlp_update 폴더에 푼다
         try:
             return {"ok": True, "version": update_frozen(), "log": ""}
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - 실패 사유를 화면에 그대로 전달
             return {"ok": False, "version": "", "log": f"{type(e).__name__}: {e}"[-300:]}
     r = subprocess.run([sys.executable, "-m", "pip", "install", "-U", "yt-dlp"], capture_output=True, text=True,
-                       creationflags=0x08000000)  # CREATE_NO_WINDOW
+                       check=False, creationflags=0x08000000)  # CREATE_NO_WINDOW
     try:
         ver = importlib.metadata.version("yt-dlp")
     except importlib.metadata.PackageNotFoundError:
@@ -544,7 +545,7 @@ def run_with_window(port: int) -> bool:
 
 if __name__ == "__main__":
     if sys.stdout is None or sys.stderr is None:  # pythonw(콘솔 없음) 실행 대비
-        sys.stdout = sys.stderr = open(os.devnull, "w")
+        sys.stdout = sys.stderr = open(os.devnull, "w")  # noqa: SIM115 - 프로세스 끝까지 열어 둠
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-window", action="store_true")

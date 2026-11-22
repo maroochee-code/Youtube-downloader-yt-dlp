@@ -29,7 +29,10 @@ import uvicorn
 import yt_dlp
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+import editor
 
 BASE = APP_DIR
 STATIC = RES_DIR / "static"
@@ -490,6 +493,10 @@ def api_restart():
 def api_quit():
     threading.Timer(0.3, lambda: os._exit(0)).start()
     return {"ok": True}
+
+
+app.include_router(editor.make_router(APP_DIR, media_dir, jobs, _lock))
+app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
 @app.get("/")

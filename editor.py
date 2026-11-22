@@ -1,0 +1,511 @@
+"""영상 편집 엔진: 편집 목록(JSON) -> ffmpeg 내보내기.
+
+화면(static/editor.js)은 편집 목록만 고치고, 마지막에 이 모듈이 목록대로 ffmpeg 로 영상을 만든다.
+원본 파일은 건드리지 않는다.
+"""
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from pathlib import Path
+
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import FileResponse
+
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+ASPECTS = {"16:9": (1920, 1080), "9:16": (1080, 1920), "1:1": (1080, 1080)}
+SUB_POS = {"bottom": 2, "middle": 5, "top": 8}  # ASS 정렬 번호
+FONT_FILES = ("malgun.ttf", "malgunbd.ttf")  # 윈도우 기본 한글 폰트(맑은 고딕)
+BAD_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+
+class EditError(ValueError):
+    """사용자에게 그대로 보여 줄 수 있는 편집 오류."""
+
+
+# ---------- 도구 찾기 / 파일 정보 ----------
+def find_tool(name: str, app_dir: Path) -> str:
+    for d in (app_dir / "ffmpeg", app_dir / "ffmpeg_bin"):
+        for exe in (d / f"{name}.exe", d / name):
+            if exe.is_file():
+                return str(exe)
+    return shutil.which(name) or name
+
+
+def probe(path: Path, app_dir: Path) -> dict:
+    cmd = [find_tool("ffprobe", app_dir), "-v", "error", "-print_format", "json", "-show_format", "-show_streams",
+           str(path)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           check=False, creationflags=CREATE_NO_WINDOW, timeout=60)
+        d = json.loads(r.stdout or "{}")
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        raise EditError(f"파일 정보를 읽지 못했습니다: {e}") from e
+    vs = next((s for s in d.get("streams", []) if s.get("codec_type") == "video"
+               and not (s.get("disposition") or {}).get("attached_pic")), None)
+    has_audio = any(s.get("codec_type") == "audio" for s in d.get("streams", []))
+    dur = float((d.get("format") or {}).get("duration") or (vs or {}).get("duration") or 0)
+    if not vs and not has_audio:
+        raise EditError("영상이나 오디오 파일이 아닙니다.")
+    fps = 0.0
+    if vs and "/" in str(vs.get("avg_frame_rate", "")):
+        a, _, b = vs["avg_frame_rate"].partition("/")
+        fps = float(a) / float(b) if float(b or 0) else 0.0
+    return {"duration": round(dur, 3), "has_video": bool(vs), "has_audio": has_audio,
+            "width": int((vs or {}).get("width") or 0), "height": int((vs or {}).get("height") or 0),
+            "fps": round(fps, 3)}
+
+
+# ---------- 편집 목록 정리 ----------
+def _num(v, default: float, lo: float, hi: float) -> float:
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        x = default
+    return min(max(x, lo), hi)
+
+
+def _id(item: dict, prefix: str) -> str:
+    return str(item.get("id") or f"{prefix}{uuid.uuid4().hex[:6]}")
+
+
+def normalize(project: dict) -> dict:
+    """화면에서 온 값을 안전한 범위로 정리한다. 영상이 하나도 없으면 오류."""
+    out = {
+        "version": 1,
+        "name": BAD_NAME.sub("_", str(project.get("name") or "편집본")).strip(" .") or "편집본",
+        "clips": [], "audios": [], "subs": [], "texts": [],
+        "sub_style": {}, "output": {},
+    }
+    for c in project.get("clips") or []:
+        src = str(c.get("src") or "")
+        if not src:
+            continue
+        cin = _num(c.get("in"), 0, 0, 1e6)
+        cout = _num(c.get("out"), cin + 1, 0, 1e6)
+        if cout - cin < 0.05:
+            raise EditError("자른 구간이 너무 짧습니다. (0.05초 이상)")
+        out["clips"].append({"id": _id(c, "c"), "src": src, "in": cin, "out": cout,
+                             "speed": _num(c.get("speed"), 1, 0.25, 4), "volume": _num(c.get("volume"), 1, 0, 4),
+                             "mute": bool(c.get("mute"))})
+    if not out["clips"]:
+        raise EditError("타임라인에 영상이 없습니다. 왼쪽 목록에서 영상을 추가하세요.")
+    for a in project.get("audios") or []:
+        src = str(a.get("src") or "")
+        if not src:
+            continue
+        end = a.get("out")
+        out["audios"].append({"id": _id(a, "a"), "src": src, "at": _num(a.get("at"), 0, 0, 1e6),
+                              "in": _num(a.get("in"), 0, 0, 1e6),
+                              "out": None if end in (None, "", 0) else _num(end, 0, 0, 1e6),
+                              "volume": _num(a.get("volume"), 1, 0, 4),
+                              "fade_in": _num(a.get("fade_in"), 0, 0, 60), "fade_out": _num(a.get("fade_out"), 0, 0, 60)})
+    for s in project.get("subs") or []:
+        text = str(s.get("text") or "").strip()
+        st = _num(s.get("start"), 0, 0, 1e6)
+        en = _num(s.get("end"), st + 2, 0, 1e6)
+        if text and en > st:
+            out["subs"].append({"id": _id(s, "s"), "start": st, "end": en, "text": text})
+    for t in project.get("texts") or []:
+        text = str(t.get("text") or "").strip()
+        st = _num(t.get("start"), 0, 0, 1e6)
+        en = _num(t.get("end"), st + 3, 0, 1e6)
+        if text and en > st:
+            out["texts"].append({"id": _id(t, "t"), "start": st, "end": en, "text": text,
+                                 "x": _num(t.get("x"), 0.5, 0, 1), "y": _num(t.get("y"), 0.15, 0, 1),
+                                 "size": _num(t.get("size"), 56, 10, 300), "color": _color(t.get("color"), "#ffffff")})
+    ss = project.get("sub_style") or {}
+    pos = ss.get("pos") if ss.get("pos") in SUB_POS else "bottom"
+    out["sub_style"] = {"size": _num(ss.get("size"), 48, 10, 200), "color": _color(ss.get("color"), "#ffffff"),
+                        "outline": _color(ss.get("outline"), "#000000"), "pos": pos}
+    o = project.get("output") or {}
+    out["output"] = {"aspect": o.get("aspect") if o.get("aspect") in ASPECTS else "original"}
+    return out
+
+
+def _color(v, default: str) -> str:
+    return v if isinstance(v, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", v) else default
+
+
+def clip_duration(c: dict) -> float:
+    return (c["out"] - c["in"]) / c["speed"]
+
+
+def total_duration(p: dict) -> float:
+    return sum(clip_duration(c) for c in p["clips"])
+
+
+# ---------- SRT / ASS ----------
+SRT_TIME = re.compile(r"(\d+):(\d+):(\d+)[,.](\d{1,3})\s*-->\s*(\d+):(\d+):(\d+)[,.](\d{1,3})")
+
+
+def parse_srt(text: str) -> list[dict]:
+    text = text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    subs = []
+    for block in re.split(r"\n\s*\n", text.strip()):
+        lines = block.split("\n")
+        for i, line in enumerate(lines):
+            m = SRT_TIME.search(line)
+            if m:
+                g = m.groups()
+                st = int(g[0]) * 3600 + int(g[1]) * 60 + int(g[2]) + int(g[3].ljust(3, "0")) / 1000
+                en = int(g[4]) * 3600 + int(g[5]) * 60 + int(g[6]) + int(g[7].ljust(3, "0")) / 1000
+                body = "\n".join(lines[i + 1:]).strip()
+                if body and en > st:
+                    subs.append({"id": f"s{uuid.uuid4().hex[:6]}", "start": round(st, 3), "end": round(en, 3),
+                                 "text": body})
+                break
+    return subs
+
+
+def _srt_time(t: float) -> str:
+    ms = round(t * 1000)
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def format_srt(subs: list[dict]) -> str:
+    rows = sorted((s for s in subs if str(s.get("text", "")).strip()), key=lambda s: float(s["start"]))
+    return "\n".join(f"{i}\n{_srt_time(float(s['start']))} --> {_srt_time(float(s['end']))}\n{s['text'].strip()}\n"
+                     for i, s in enumerate(rows, 1))
+
+
+def ass_time(t: float) -> str:
+    cs = round(t * 100)
+    h, cs = divmod(cs, 360000)
+    m, cs = divmod(cs, 6000)
+    s, cs = divmod(cs, 100)
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def ass_color(hex_color: str) -> str:
+    r, g, b = hex_color[1:3], hex_color[3:5], hex_color[5:7]
+    return f"&H00{b}{g}{r}".upper()
+
+
+def ass_text(t: str) -> str:
+    return t.replace("\r", "").replace("{", "\\{").replace("}", "\\}").replace("\n", "\\N")
+
+
+def build_ass(p: dict, w: int, h: int, font: str = "Malgun Gothic") -> str:
+    scale = min(w, h) / 1080
+    st = p["sub_style"]
+    size = round(st["size"] * scale)
+    margin_v = round(h * 0.06)
+    lines = [
+        "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {w}", f"PlayResY: {h}", "WrapStyle: 0",
+        "ScaledBorderAndShadow: yes", "",
+        "[V4+ Styles]",
+        ("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, "
+         "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, "
+         "MarginR, MarginV, Encoding"),
+        (f"Style: Sub,{font},{size},{ass_color(st['color'])},&H000000FF,{ass_color(st['outline'])},&H64000000,1,0,0,0,"
+         f"100,100,0,0,1,{max(1, round(3 * scale))},1,{SUB_POS[st['pos']]},{round(w * 0.05)},{round(w * 0.05)},"
+         f"{margin_v},1"),
+        (f"Style: Txt,{font},{size},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,"
+         f"{max(1, round(3 * scale))},1,5,20,20,20,1"),
+        "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    for s in p["subs"]:
+        lines.append(f"Dialogue: 0,{ass_time(s['start'])},{ass_time(s['end'])},Sub,,0,0,0,,{ass_text(s['text'])}")
+    for t in p["texts"]:
+        tag = (f"{{\\an5\\pos({round(t['x'] * w)},{round(t['y'] * h)})\\fs{round(t['size'] * scale)}"
+               f"\\c{ass_color(t['color'])}}}")
+        lines.append(f"Dialogue: 1,{ass_time(t['start'])},{ass_time(t['end'])},Txt,,0,0,0,,{tag}{ass_text(t['text'])}")
+    return "\n".join(lines) + "\n"
+
+
+# ---------- ffmpeg 필터 그래프 ----------
+def atempo_chain(speed: float) -> str:
+    parts, s = [], speed
+    while s > 2.0:
+        parts.append("atempo=2.0")
+        s /= 2.0
+    while s < 0.5:
+        parts.append("atempo=0.5")
+        s /= 0.5
+    if abs(s - 1.0) > 1e-6 or not parts:
+        parts.append(f"atempo={s:.5f}")
+    return ",".join(parts) if abs(speed - 1.0) > 1e-6 else ""
+
+
+AFMT = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo"
+
+
+def build_plan(project: dict, resolve, probe_fn) -> dict:
+    """편집 목록 -> {graph, inputs, size, duration, ass}. resolve(src)->Path, probe_fn(Path)->dict."""
+    p = normalize(project)
+    inputs: list[str] = []
+    infos: dict[str, dict] = {}
+    index: dict[str, int] = {}
+
+    def use(src: str) -> int:
+        if src not in index:
+            path = resolve(src)
+            infos[src] = probe_fn(path)
+            index[src] = len(inputs)
+            inputs.append(str(path))
+        return index[src]
+
+    first = None
+    for c in p["clips"]:
+        use(c["src"])
+        if not infos[c["src"]]["has_video"]:
+            raise EditError(f"영상이 아닌 파일은 타임라인에 넣을 수 없습니다: {c['src']}")
+        c["out"] = min(c["out"], infos[c["src"]]["duration"] or c["out"])
+        if c["out"] - c["in"] < 0.05:
+            raise EditError("자른 구간이 영상 길이를 벗어났습니다.")
+        first = first or infos[c["src"]]
+    asp = p["output"]["aspect"]
+    if asp in ASPECTS:
+        w, h = ASPECTS[asp]
+    else:
+        w, h = (first["width"] // 2 * 2) or 1280, (first["height"] // 2 * 2) or 720
+    fps = int(min(60, max(15, round(first["fps"] or 30))))
+
+    g: list[str] = []
+    for n, c in enumerate(p["clips"]):
+        i, info = index[c["src"]], infos[c["src"]]
+        dur = clip_duration(c)
+        g.append(f"[{i}:v]trim=start={c['in']:.3f}:end={c['out']:.3f},setpts=(PTS-STARTPTS)/{c['speed']:.5f},"
+                 f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                 f"setsar=1,fps={fps},format=yuv420p[v{n}]")
+        if info["has_audio"] and not c["mute"]:
+            tempo = atempo_chain(c["speed"])
+            g.append(f"[{i}:a]atrim=start={c['in']:.3f}:end={c['out']:.3f},asetpts=PTS-STARTPTS,"
+                     + (tempo + "," if tempo else "") + f"volume={c['volume']:.3f},{AFMT},apad,"
+                     f"atrim=duration={dur:.3f},asetpts=PTS-STARTPTS[a{n}]")
+        else:
+            g.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={dur:.3f},asetpts=PTS-STARTPTS[a{n}]")
+    n = len(p["clips"])
+    g.append("".join(f"[v{k}][a{k}]" for k in range(n)) + f"concat=n={n}:v=1:a=1[vc][ac]")
+
+    extras = []
+    for k, a in enumerate(p["audios"]):
+        j = use(a["src"])
+        if not infos[a["src"]]["has_audio"]:
+            raise EditError(f"오디오가 없는 파일입니다: {a['src']}")
+        end = a["out"] if a["out"] else infos[a["src"]]["duration"]
+        d = max(0.05, end - a["in"])
+        f = f"[{j}:a]atrim=start={a['in']:.3f}:end={a['in'] + d:.3f},asetpts=PTS-STARTPTS,volume={a['volume']:.3f}"
+        if a["fade_in"]:
+            f += f",afade=t=in:st=0:d={min(a['fade_in'], d):.3f}"
+        if a["fade_out"]:
+            fo = min(a["fade_out"], d)
+            f += f",afade=t=out:st={d - fo:.3f}:d={fo:.3f}"
+        if a["at"] > 0:
+            f += f",adelay={round(a['at'] * 1000)}:all=1"
+        g.append(f + f",{AFMT}[x{k}]")
+        extras.append(f"[x{k}]")
+    if extras:
+        g.append("[ac]" + "".join(extras) + f"amix=inputs={len(extras) + 1}:duration=first:normalize=0,"
+                 "alimiter=limit=0.95[am]")
+        amap = "[am]"
+    else:
+        amap = "[ac]"
+
+    ass = None
+    if p["subs"] or p["texts"]:
+        ass = build_ass(p, w, h)
+        g.append("[vc]ass=sub.ass:fontsdir=fonts[vout]")
+        vmap = "[vout]"
+    else:
+        vmap = "[vc]"
+    return {"project": p, "graph": ";".join(g), "inputs": inputs, "size": (w, h), "duration": total_duration(p),
+            "ass": ass, "vmap": vmap, "amap": amap}
+
+
+def prepare_workdir(plan: dict, work: Path, app_dir: Path) -> None:
+    """그래프/자막/폰트 파일을 작업 폴더에 쓴다. (경로 이스케이프 문제를 피하려고 상대 경로로 쓴다.)"""
+    work.mkdir(parents=True, exist_ok=True)
+    (work / "graph.txt").write_text(plan["graph"], encoding="utf-8")
+    if plan["ass"]:
+        (work / "sub.ass").write_text(plan["ass"], encoding="utf-8")
+        fonts = work / "fonts"
+        fonts.mkdir(exist_ok=True)
+        for src in (app_dir / "fonts", Path(r"C:\Windows\Fonts")):
+            found = [src / f for f in FONT_FILES if (src / f).is_file()]
+            if not found and src.is_dir() and src == app_dir / "fonts":
+                found = list(src.glob("*.[to]tf"))
+            for f in found:
+                shutil.copy2(f, fonts / f.name)
+            if found:
+                break
+
+
+def build_command(plan: dict, out_path: Path, app_dir: Path) -> list[str]:
+    cmd = [find_tool("ffmpeg", app_dir), "-hide_banner", "-nostdin", "-y"]
+    for path in plan["inputs"]:
+        cmd += ["-i", path]
+    # 명령줄 길이 제한(윈도우 약 3만 자)을 넘는 긴 그래프만 파일로 전달한다. (ffmpeg 7 이상의 -/옵션 문법)
+    graph = ["-/filter_complex", "graph.txt"] if len(plan["graph"]) > 20000 else ["-filter_complex", plan["graph"]]
+    return cmd + graph + ["-map", plan["vmap"], "-map", plan["amap"],
+                  "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+                  "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
+                  "-progress", "pipe:1", "-nostats", str(out_path)]
+
+
+def unique_path(d: Path, name: str, ext: str = ".mp4") -> Path:
+    p = d / f"{name}{ext}"
+    n = 2
+    while p.exists():
+        p = d / f"{name} ({n}){ext}"
+        n += 1
+    return p
+
+
+# ---------- 서버 연결 ----------
+def make_router(app_dir: Path, media_dir, jobs: dict, lock: threading.Lock) -> APIRouter:
+    r = APIRouter(prefix="/api/edit")
+    assets = app_dir / "edit_assets"
+    projects = app_dir / "projects"
+
+    def resolve(src: str) -> Path:
+        if src.startswith("asset:"):
+            base, name = assets.resolve(), src[6:]
+        else:
+            base, name = media_dir().resolve(), src
+        p = (base / name).resolve()
+        if p.parent != base or not p.is_file():
+            raise EditError(f"파일을 찾을 수 없습니다: {src}")
+        return p
+
+    def pr(path: Path) -> dict:
+        return probe(path, app_dir)
+
+    def guard(fn):
+        try:
+            return fn()
+        except EditError as e:
+            raise HTTPException(400, str(e)) from e
+
+    @r.get("/probe")
+    def api_probe(src: str):
+        return guard(lambda: pr(resolve(src)))
+
+    @r.get("/media")
+    def api_media(src: str):
+        return guard(lambda: FileResponse(resolve(src)))
+
+    @r.post("/asset")
+    async def api_asset(request: Request, name: str):
+        safe = BAD_NAME.sub("_", Path(name).name).strip(" .") or "audio"
+        assets.mkdir(parents=True, exist_ok=True)
+        dest = unique_path(assets, Path(safe).stem, Path(safe).suffix)
+        with dest.open("wb") as f:
+            async for chunk in request.stream():
+                f.write(chunk)
+        try:
+            info = pr(dest)
+        except EditError as e:
+            dest.unlink(missing_ok=True)
+            raise HTTPException(400, str(e)) from e
+        return {"src": f"asset:{dest.name}", "name": dest.name, **info}
+
+    @r.get("/projects")
+    def api_projects():
+        projects.mkdir(parents=True, exist_ok=True)
+        rows = [{"name": p.stem, "mtime": p.stat().st_mtime} for p in projects.glob("*.json")]
+        return sorted(rows, key=lambda x: x["mtime"], reverse=True)
+
+    def project_path(name: str) -> Path:
+        safe = BAD_NAME.sub("_", name).strip(" .")
+        if not safe:
+            raise HTTPException(400, "프로젝트 이름을 입력하세요.")
+        projects.mkdir(parents=True, exist_ok=True)
+        return projects / f"{safe}.json"
+
+    @r.get("/project")
+    def api_project_load(name: str):
+        p = project_path(name)
+        if not p.is_file():
+            raise HTTPException(404, "프로젝트를 찾을 수 없습니다.")
+        return json.loads(p.read_text(encoding="utf-8"))
+
+    @r.post("/project")
+    def api_project_save(body: dict):
+        data = body.get("data")
+        if not isinstance(data, dict):
+            raise HTTPException(400, "저장할 내용이 없습니다.")
+        p = project_path(str(body.get("name") or data.get("name") or ""))
+        data["name"] = p.stem
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        return {"ok": True, "name": p.stem}
+
+    @r.post("/project/delete")
+    def api_project_delete(body: dict):
+        project_path(str(body.get("name") or "")).unlink(missing_ok=True)
+        return {"ok": True}
+
+    @r.post("/srt/parse")
+    def api_srt_parse(body: dict):
+        subs = parse_srt(str(body.get("text") or ""))
+        if not subs:
+            raise HTTPException(400, "자막 형식(SRT)을 읽지 못했습니다.")
+        return {"subs": subs}
+
+    @r.post("/srt/format")
+    def api_srt_format(body: dict):
+        return {"text": format_srt(body.get("subs") or [])}
+
+    def run_export(jid: str, plan: dict, work: Path, tmp: Path, final: Path) -> None:
+        job = jobs[jid]
+        proc = None
+        try:
+            prepare_workdir(plan, work, app_dir)
+            log = (work / "ffmpeg.log").open("w", encoding="utf-8", errors="replace")
+            proc = subprocess.Popen(build_command(plan, tmp, app_dir), cwd=work, stdout=subprocess.PIPE, stderr=log,
+                                    text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW)
+            total = max(plan["duration"], 0.1)
+            for line in proc.stdout:
+                if job["cancel"]:
+                    proc.kill()
+                    break
+                m = re.match(r"out_time_(?:us|ms)=(\d+)", line)
+                if m:
+                    job["percent"] = round(min(99.0, int(m.group(1)) / 1e6 / total * 100), 1)
+            proc.wait()
+            log.close()
+            if job["cancel"]:
+                job["status"] = "cancelled"
+                tmp.unlink(missing_ok=True)
+            elif proc.returncode != 0:
+                tail = (work / "ffmpeg.log").read_text(encoding="utf-8", errors="replace").strip().splitlines()[-4:]
+                job.update(status="error", error="내보내기 실패: " + " / ".join(tail)[-300:])
+                tmp.unlink(missing_ok=True)
+            else:
+                tmp.replace(final)
+                job.update(status="done", percent=100, title=final.name, output=final.name)
+        except (EditError, OSError) as e:
+            job.update(status="error", error=str(e))
+            if proc and proc.poll() is None:
+                proc.kill()
+            tmp.unlink(missing_ok=True)
+        finally:
+            job["finished"] = time.time()
+            shutil.rmtree(work, ignore_errors=True)
+
+    @r.post("/export")
+    def api_export(body: dict):
+        plan = guard(lambda: build_plan(body, resolve, pr))
+        d = media_dir()
+        final = unique_path(d, plan["project"]["name"])
+        tmp = d / f"{final.stem}.temp.mp4"
+        work = app_dir / "edit_work" / uuid.uuid4().hex[:8]
+        jid = uuid.uuid4().hex[:8]
+        with lock:
+            jobs[jid] = {"id": jid, "url": "", "title": f"편집 내보내기: {final.name}", "status": "processing",
+                         "percent": 0, "speed": None, "eta": None, "stage": "Export", "index": None, "total": None,
+                         "error": None, "cancel": False, "started": time.time(), "finished": None, "mode": "edit"}
+        threading.Thread(target=run_export, args=(jid, plan, work, tmp, final), daemon=True).start()
+        return {"id": jid, "output": final.name}
+
+    return r

@@ -13,6 +13,10 @@ download/
 config.json
 archive.txt
 yt_dlp_update/
+projects/
+edit_assets/
+edit_work/
+.pytest_cache/
 
 # Python
 __pycache__/

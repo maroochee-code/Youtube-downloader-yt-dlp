@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -106,6 +107,26 @@ def _id(item: dict, prefix: str) -> str:
 
 def _color(v, default: str) -> str:
     return v if isinstance(v, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", v) else default
+
+
+FX_IN = ("none", "fade", "typing", "pop", "slide-l", "slide-r", "slide-u", "slide-d", "blur", "zoom")
+FX_OUT = ("none", "fade")
+FX_LOOP = ("none", "shake", "float", "marquee-l", "marquee-r")
+
+
+def _fx(raw) -> dict | None:
+    """자막/글자 연출 설정. 딕셔너리가 아니면 None(= 공통 설정을 따름)."""
+    if not isinstance(raw, dict):
+        return None
+    return {"in": raw.get("in") if raw.get("in") in FX_IN else "none", "in_dur": _num(raw.get("in_dur"), 0.5, 0.1, 5),
+            "out": raw.get("out") if raw.get("out") in FX_OUT else "none", "out_dur": _num(raw.get("out_dur"), 0.4, 0.1, 5),
+            "loop": raw.get("loop") if raw.get("loop") in FX_LOOP else "none",
+            "kara": bool(raw.get("kara")), "kara_color": _color(raw.get("kara_color"), "#ffd24d"),
+            "box": bool(raw.get("box")), "box_color": _color(raw.get("box_color"), "#000000"),
+            "box_opacity": _num(raw.get("box_opacity"), 0.6, 0, 1)}
+
+
+NO_FX = _fx({})
 
 
 def _kf(raw) -> list[dict]:
@@ -232,7 +253,7 @@ def normalize(project: dict) -> dict:
         st = _num(s.get("start"), 0, 0, 1e6)
         en = _num(s.get("end"), st + 2, 0, 1e6)
         if text and en > st:
-            out["subs"].append({"id": _id(s, "s"), "start": st, "end": en, "text": text})
+            out["subs"].append({"id": _id(s, "s"), "start": st, "end": en, "text": text, "fx": _fx(s.get("fx"))})
     for t in project.get("texts") or []:
         text = str(t.get("text") or "").strip()
         st = _num(t.get("start"), 0, 0, 1e6)
@@ -240,11 +261,13 @@ def normalize(project: dict) -> dict:
         if text and en > st:
             out["texts"].append({"id": _id(t, "t"), "start": st, "end": en, "text": text,
                                  "x": _num(t.get("x"), 0.5, 0, 1), "y": _num(t.get("y"), 0.15, 0, 1),
-                                 "size": _num(t.get("size"), 56, 10, 300), "color": _color(t.get("color"), "#ffffff")})
+                                 "size": _num(t.get("size"), 56, 10, 300), "color": _color(t.get("color"), "#ffffff"),
+                                 "fx": _fx(t.get("fx")) or dict(NO_FX)})
     ss = project.get("sub_style") or {}
     pos = ss.get("pos") if ss.get("pos") in SUB_POS else "bottom"
     out["sub_style"] = {"size": _num(ss.get("size"), 48, 10, 200), "color": _color(ss.get("color"), "#ffffff"),
-                        "outline": _color(ss.get("outline"), "#000000"), "pos": pos}
+                        "outline": _color(ss.get("outline"), "#000000"), "pos": pos,
+                        "fx": _fx(ss.get("fx")) or dict(NO_FX)}
     o = project.get("output") or {}
     size = o.get("size")
     fps_o = o.get("fps")
@@ -353,31 +376,133 @@ def ass_text(t: str) -> str:
     return t.replace("\r", "").replace("{", "\\{").replace("}", "\\}").replace("\n", "\\N")
 
 
+def text_width(text: str, size: float) -> float:
+    """글자 폭 어림값(한글/한자는 글자 크기, 영문/숫자는 약 0.55배). 흐르는 자막의 이동 거리 계산용."""
+    return max((sum(size if ord(ch) > 0x2E80 else size * 0.55 for ch in line) for line in text.split("\n")), default=0)
+
+
+def _alpha(op: float) -> str:
+    return f"&H{round((1 - op) * 255):02X}&"
+
+
+def fx_dialogues(layer: int, style: str, start: float, end: float, text: str, fx: dict, *, w: int, h: int,
+                 size: float, an: int, pos: tuple[float, float], base: str, color: str, place: bool) -> list[str]:
+    """한 줄의 자막/글자를 연출 효과가 들어간 ASS Dialogue 줄(들)로 만든다.
+
+    place=True 이면 \\an/\\pos 를 직접 지정한다(글자 클립은 항상, 자막은 슬라이드/흐름처럼 위치가 필요할 때만).
+    """
+    dur = max(end - start, 0.05)
+    dms = round(dur * 1000)
+    ims = min(round(fx["in_dur"] * 1000), dms)
+    oms = min(round(fx["out_dur"] * 1000), dms) if fx["out"] == "fade" else 0
+    x, y = pos
+    tags = base
+    kind, loop = fx["in"], fx["loop"]
+    need_pos = place or kind.startswith("slide") or loop.startswith("marquee")
+    move = ""
+    if need_pos:
+        tags += f"\\an{an}"
+    if loop.startswith("marquee"):
+        tw = text_width(text, size)
+        x1, x2 = (w + tw / 2, -tw / 2) if loop == "marquee-l" else (-tw / 2, w + tw / 2)
+        yy = y - (size / 2 if an == 2 else -size / 2 if an == 8 else 0)
+        move = f"\\an5\\move({x1:.0f},{yy:.0f},{x2:.0f},{yy:.0f},0,{dms})"
+        tags = tags.replace(f"\\an{an}", "", 1) + move
+        kind = "none"
+        oms = 0
+    elif kind.startswith("slide"):
+        d = {"slide-l": (-w * 0.45, 0), "slide-r": (w * 0.45, 0), "slide-u": (0, -h * 0.3), "slide-d": (0, h * 0.3)}[kind]
+        tags += f"\\move({x + d[0]:.0f},{y + d[1]:.0f},{x:.0f},{y:.0f},0,{ims})"
+    elif need_pos:
+        tags += f"\\pos({x:.0f},{y:.0f})"
+    if kind == "pop":
+        tags += f"\\fscx45\\fscy45\\t(0,{ims},\\fscx112\\fscy112)\\t({ims},{ims + 160},\\fscx100\\fscy100)"
+    elif kind == "zoom":
+        tags += f"\\fscx230\\fscy230\\alpha&HFF&\\t(0,{ims},\\fscx100\\fscy100\\alpha&H00&)"
+    elif kind == "blur":
+        tags += f"\\blur28\\t(0,{ims},\\blur0)"
+    fin = ims if kind == "fade" else 0
+    if fin or oms:
+        tags += f"\\fad({fin},{oms})"
+    if loop == "shake":
+        step = max(60, dms // 200)
+        for i, t0 in enumerate(range(0, dms, step)):
+            tags += f"\\t({t0},{t0 + step},\\frz{2.2 if i % 2 == 0 else -2.2})"
+    elif loop == "float":
+        step = max(140, dms // 200)
+        for i, t0 in enumerate(range(0, dms, step)):
+            sw = math.sin(i * 0.9)
+            tags += f"\\t({t0},{t0 + step},\\frz{1.6 * sw:.2f}\\fscy{100 + 4 * sw:.1f})"
+    if fx["box"]:
+        tags += f"\\3c{ass_color(fx['box_color'])}\\3a{_alpha(fx['box_opacity'])}\\4a&HFF&"
+    chars = [c for c in text.replace("\r", "")]
+
+    def one(t0: float, t1: float, body: str, extra: str = "") -> str:
+        return f"Dialogue: {layer},{ass_time(t0)},{ass_time(t1)},{style},,0,0,0,,{{{tags}{extra}}}{body}"
+
+    if kind == "typing":
+        visible = [c for c in chars if c not in " \n"]
+        n = max(len(visible), 1)
+        per = min(fx["in_dur"], dur) / n
+        out = []
+        seen = 0
+        for i, ch in enumerate(chars):
+            if ch not in " \n":
+                seen += 1
+            else:
+                continue
+            # i번째 글자까지 보이고 나머지는 투명하게 둬서 가운데 정렬이 흔들리지 않게 한다
+            head = ass_text("".join(chars[:i + 1]))
+            tail = ass_text("".join(chars[i + 1:]))
+            t0 = start + per * (seen - 1)
+            t1 = end if seen == n else start + per * seen
+            body = head + (f"{{\\alpha&HFF&}}{tail}" if tail else "")
+            out.append(one(t0, t1, body))
+        return out or [one(start, end, ass_text(text))]
+    if fx["kara"]:
+        n = max(len([c for c in chars if c != "\n"]), 1)
+        cs = max(1, round(dur * 100 * 0.85 / n))
+        body = "".join("\\N" if ch == "\n" else f"{{\\kf{cs}}}{ass_text(ch)}" for ch in chars)
+        extra = f"\\1c{ass_color(fx['kara_color'])}\\2c{ass_color(color)}"
+        return [one(start, end, body, extra)]
+    return [one(start, end, ass_text(text))]
+
+
 def build_ass(p: dict, w: int, h: int, font: str = "Malgun Gothic") -> str:
     scale = min(w, h) / 1080
     st = p["sub_style"]
     size = round(st["size"] * scale)
     margin_v = round(h * 0.06)
+    pad = max(4, round(16 * scale))
+    fmt = ("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, "
+           "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, "
+           "MarginR, MarginV, Encoding")
+    ml = round(w * 0.05)
+    out_w = max(1, round(3 * scale))
     lines = [
         "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {w}", f"PlayResY: {h}", "WrapStyle: 0",
-        "ScaledBorderAndShadow: yes", "",
-        "[V4+ Styles]",
-        ("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, "
-         "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, "
-         "MarginR, MarginV, Encoding"),
-        (f"Style: Sub,{font},{size},{ass_color(st['color'])},&H000000FF,{ass_color(st['outline'])},&H64000000,1,0,0,0,"
-         f"100,100,0,0,1,{max(1, round(3 * scale))},1,{SUB_POS[st['pos']]},{round(w * 0.05)},{round(w * 0.05)},"
-         f"{margin_v},1"),
-        (f"Style: Txt,{font},{size},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,"
-         f"{max(1, round(3 * scale))},1,5,20,20,20,1"),
+        "ScaledBorderAndShadow: yes", "", "[V4+ Styles]", fmt,
+        (f"Style: Sub,{font},{size},{ass_color(st['color'])},{ass_color(st['color'])},{ass_color(st['outline'])},"
+         f"&H64000000,1,0,0,0,100,100,0,0,1,{out_w},1,{SUB_POS[st['pos']]},{ml},{ml},{margin_v},1"),
+        (f"Style: SubBox,{font},{size},{ass_color(st['color'])},{ass_color(st['color'])},&H80000000,&HFF000000,1,0,0,0,"
+         f"100,100,0,0,3,{pad},0,{SUB_POS[st['pos']]},{ml},{ml},{margin_v},1"),
+        (f"Style: Txt,{font},{size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,"
+         f"{out_w},1,5,20,20,20,1"),
+        (f"Style: TxtBox,{font},{size},&H00FFFFFF,&H00FFFFFF,&H80000000,&HFF000000,1,0,0,0,100,100,0,0,3,{pad},0,5,"
+         "20,20,20,1"),
         "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
-    for s in p["subs"]:
-        lines.append(f"Dialogue: 0,{ass_time(s['start'])},{ass_time(s['end'])},Sub,,0,0,0,,{ass_text(s['text'])}")
+    an = SUB_POS[st["pos"]]
+    sy = {2: h - margin_v, 5: h / 2, 8: margin_v}[an]
+    for sub in p["subs"]:
+        fx = sub["fx"] or st["fx"]
+        lines += fx_dialogues(0, "SubBox" if fx["box"] else "Sub", sub["start"], sub["end"], sub["text"], fx, w=w, h=h,
+                              size=size, an=an, pos=(w / 2, sy), base="", color=st["color"], place=False)
     for t in p["texts"]:
-        tag = (f"{{\\an5\\pos({round(t['x'] * w)},{round(t['y'] * h)})\\fs{round(t['size'] * scale)}"
-               f"\\c{ass_color(t['color'])}}}")
-        lines.append(f"Dialogue: 1,{ass_time(t['start'])},{ass_time(t['end'])},Txt,,0,0,0,,{tag}{ass_text(t['text'])}")
+        fs = round(t["size"] * scale)
+        lines += fx_dialogues(1, "TxtBox" if t["fx"]["box"] else "Txt", t["start"], t["end"], t["text"], t["fx"], w=w,
+                              h=h, size=fs, an=5, pos=(t["x"] * w, t["y"] * h), base=f"\\fs{fs}\\c{ass_color(t['color'])}",
+                              color=t["color"], place=True)
     return "\n".join(lines) + "\n"
 
 

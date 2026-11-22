@@ -387,3 +387,33 @@ def test_cover_image_and_frame_capture_and_batch(media, tmp_path):
     for x in res:
         assert wait_done(jobs, x["id"])["status"] == "done"
     assert ffprobe_of(media / "bat_9x16.mp4")["height"] == 1920
+
+
+# ---------- v1.3.1: 자막/글자 연출 ----------
+@pytest.mark.parametrize("fx,needle", [
+    ({"in": "fade", "out": "fade"}, r"\fad("), ({"in": "pop"}, r"\fscx45"), ({"in": "slide-l"}, r"\move("),
+    ({"in": "blur"}, r"\blur28"), ({"in": "zoom"}, r"\fscx230"), ({"loop": "marquee-r"}, r"\move("),
+    ({"loop": "shake"}, r"\frz"), ({"loop": "float"}, r"\fscy"), ({"kara": True}, r"\kf"),
+    ({"box": True, "box_color": "#ff0000"}, r"\3c&H000000FF")])
+def test_ass_effects_tags(fx, needle):
+    p = editor.normalize({"clips": [{"src": "a", "in": 0, "out": 3}],
+                          "subs": [{"start": 0, "end": 3, "text": "안녕 하세요", "fx": fx}],
+                          "texts": [{"start": 0, "end": 3, "text": "제목", "fx": fx}]})
+    ass = editor.build_ass(p, 1920, 1080)
+    assert ass.count(needle) >= 2
+
+
+def test_ass_typing_events_and_default_fx():
+    p = editor.normalize({"clips": [{"src": "a", "in": 0, "out": 3}], "subs": [{"start": 1, "end": 4, "text": "가나다"}],
+                          "sub_style": {"fx": {"in": "typing", "in_dur": 1.5}}})
+    ev = [ln for ln in editor.build_ass(p, 1280, 720).splitlines() if ln.startswith("Dialogue")]
+    assert len(ev) == 3 and ev[-1].endswith("가나다") and r"{\alpha&HFF&}" in ev[0]
+    assert p["subs"][0]["fx"] is None and p["sub_style"]["fx"]["in"] == "typing"
+
+
+def test_export_with_effects(media, tmp_path):
+    out = export(media, tmp_path, {
+        "name": "fxsub", "version": 2, "clips": [{"src": "a.mp4", "track": 0, "start": 0, "in": 0, "out": 3}],
+        "subs": [{"start": 0, "end": 3, "text": "타이핑 자막", "fx": {"in": "typing", "out": "fade", "box": True}}],
+        "texts": [{"start": 0, "end": 3, "text": "흐르는 글자", "x": 0.5, "y": 0.2, "fx": {"loop": "marquee-l"}}]})
+    assert ffprobe_of(out)["duration"] == pytest.approx(3.0, abs=0.3)

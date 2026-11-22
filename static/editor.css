@@ -104,4 +104,5 @@
 .mkrow input{flex:1;min-width:0;padding:2px 6px;font-size:12px}
 .mkrow button{padding:2px 6px;font-size:11px}
 .blk.clip.solid{background:#7a5fb0}
+.blk s.kf{position:absolute;top:2px;width:7px;height:7px;margin-left:-3px;background:#ffd24d;border:1px solid #805f00;transform:rotate(45deg);z-index:3;cursor:pointer;text-decoration:none}
 @media (max-width:1000px){.ed-main{grid-template-columns:220px minmax(0,1fr)}.ed-right{display:none}}

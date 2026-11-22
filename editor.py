@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import shutil
@@ -22,6 +23,7 @@ CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 ASPECTS = {"16:9": (1920, 1080), "9:16": (1080, 1920), "1:1": (1080, 1080)}
 SUB_POS = {"bottom": 2, "middle": 5, "top": 8}  # ASS 정렬 번호
 FONT_FILES = ("malgun.ttf", "malgunbd.ttf")  # 윈도우 기본 한글 폰트(맑은 고딕)
+CRF = {"high": 17, "normal": 20, "small": 25}
 IMAGE_EXT = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
 BAD_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
@@ -106,6 +108,18 @@ def _color(v, default: str) -> str:
     return v if isinstance(v, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", v) else default
 
 
+def _kf(raw) -> list[dict]:
+    """키프레임: 클립 안에서의 시간 t(초)와 그 순간의 위치/크기/투명도."""
+    pts: dict[float, dict] = {}
+    for k in (raw if isinstance(raw, list) else [])[:60]:
+        if not isinstance(k, dict):
+            continue
+        t = round(_num(k.get("t"), 0, 0, 3600), 3)
+        pts[t] = {"t": t, "x": _num(k.get("x"), 0.5, -2, 3), "y": _num(k.get("y"), 0.5, -2, 3),
+                  "scale": _num(k.get("scale"), 1, 0.05, 5), "opacity": _num(k.get("opacity"), 1, 0, 1)}
+    return [pts[t] for t in sorted(pts)]
+
+
 def migrate(project: dict) -> dict:
     """v1(영상 한 줄, 순서대로) 프로젝트를 v2(줄 번호 + 시작 시간)로 바꾼다. 이미 v2면 그대로."""
     if not isinstance(project, dict):
@@ -187,6 +201,12 @@ def normalize(project: dict) -> dict:
             "fade_in": _num(c.get("fade_in"), 0, 0, 60), "fade_out": _num(c.get("fade_out"), 0, 0, 60),
             "trans": {"type": ttype} if ttype in TRANS_TYPES else None,
             "freeze": freeze, "image": image, "solid": solid, "hold": _num(c.get("hold"), 2, 0.1, 3600),
+            "fit": c.get("fit") if c.get("fit") in ("contain", "cover") else None,
+            "brightness": _num(c.get("brightness"), 0, -1, 1), "contrast": _num(c.get("contrast"), 1, 0, 3),
+            "saturation": _num(c.get("saturation"), 1, 0, 3), "gray": bool(c.get("gray")),
+            "blur": _num(c.get("blur"), 0, 0, 30), "flip_h": bool(c.get("flip_h")), "flip_v": bool(c.get("flip_v")),
+            "rotate": int(_num(c.get("rotate"), 0, 0, 270)) // 90 * 90 % 360,
+            "reverse": bool(c.get("reverse")) and not freeze, "kf": _kf(c.get("kf")),
             "link": c.get("link") or None})
     if not out["clips"]:
         raise EditError("타임라인에 영상이 없습니다. 왼쪽 목록에서 영상을 추가하세요.")
@@ -226,8 +246,16 @@ def normalize(project: dict) -> dict:
     out["sub_style"] = {"size": _num(ss.get("size"), 48, 10, 200), "color": _color(ss.get("color"), "#ffffff"),
                         "outline": _color(ss.get("outline"), "#000000"), "pos": pos}
     o = project.get("output") or {}
+    size = o.get("size")
+    fps_o = o.get("fps")
+    cover = o.get("cover_t")
     out["output"] = {"aspect": o.get("aspect") if o.get("aspect") in ASPECTS else "original",
-                     "loudnorm": bool(o.get("loudnorm"))}
+                     "loudnorm": bool(o.get("loudnorm")), "fill": bool(o.get("fill")),
+                     "size": int(size) if str(size).isdigit() and 240 <= int(size) <= 2160 else "auto",
+                     "quality": o.get("quality") if o.get("quality") in CRF else "normal",
+                     "fps": int(fps_o) if str(fps_o).isdigit() and 10 <= int(fps_o) <= 60 else "auto",
+                     "format": o.get("format") if o.get("format") in ("mp4", "gif", "mp3") else "mp4",
+                     "cover_t": None if cover in (None, "") else _num(cover, 0, 0, 1e5)}
     return out
 
 
@@ -418,15 +446,50 @@ def duck_expr(spans: list[tuple[float, float]], level: float) -> str:
     return f"1-{1 - level:.3f}*{acc}"
 
 
+def pw_expr(points: list[tuple[float, float]], var: str) -> str:
+    """(시간, 값) 목록을 직선으로 이어 주는 ffmpeg 식. 첫 점 이전/마지막 점 이후에는 그 값을 유지한다."""
+    if len(points) == 1:
+        return f"{points[0][1]:.5f}"
+    expr = f"{points[-1][1]:.5f}"
+    for (t0, v0), (t1, v1) in reversed(list(itertools.pairwise(points))):
+        span = max(t1 - t0, 1e-3)
+        seg = f"{v0:.5f}+({v1 - v0:.5f})*clip(({var}-{t0:.3f})/{span:.3f},0,1)"
+        expr = f"if(lt({var},{t1:.3f}),{seg},{expr})"
+    return expr
+
+
+def kf_points(c: dict, key: str, shift: float = 0.0) -> list[tuple[float, float]]:
+    return [(k["t"] + shift, k[key]) for k in c["kf"]]
+
+
+def canvas_size(p: dict, first: dict) -> tuple[int, int]:
+    o = p["output"]
+    asp, short = o["aspect"], o["size"]
+    if asp in ASPECTS:
+        w, h = ASPECTS[asp]
+        if short != "auto":
+            k = short / min(w, h)
+            w, h = round(w * k / 2) * 2, round(h * k / 2) * 2
+        return w, h
+    w, h = (first["width"] // 2 * 2) or 1280, (first["height"] // 2 * 2) or 720
+    if short != "auto":
+        k = short / min(w, h)
+        w, h = round(w * k / 2) * 2, round(h * k / 2) * 2
+    return w, h
+
+
 def build_plan(project: dict, resolve, probe_fn) -> dict:
-    """편집 목록 -> {graph, inputs, size, duration, ass}. resolve(src)->Path, probe_fn(Path)->dict.
+    """편집 목록 -> {graph, inputs, size, duration, ass, ...}. resolve(src)->Path, probe_fn(Path)->dict.
 
     검은 바탕 위에 영상 클립을 줄 번호(아래->위) 순서로 겹쳐 놓고, 소리는 모두 시간 위치에 맞춰 섞는다.
+    graph = 영상 부분(vgraph) + 소리 부분(agraph). mp3 는 소리만, gif/프레임 캡처는 영상만 쓴다.
     """
     p = normalize(project)
     inputs: list[str] = []
     infos: dict[str, dict] = {}
     index: dict[str, int] = {}
+    out_o = p["output"]
+    fmt = out_o["format"]
 
     def use(src: str) -> int:
         if src not in index:
@@ -450,68 +513,141 @@ def build_plan(project: dict, resolve, probe_fn) -> dict:
             c["out"] = min(c["out"], info["duration"] or c["out"])
             if c["out"] - c["in"] < 0.05:
                 raise EditError("자른 구간이 영상 길이를 벗어났습니다.")
+            if c["reverse"] and c["out"] - c["in"] > MAX_REVERSE:
+                raise EditError(f"역재생은 {MAX_REVERSE}초 이하의 구간만 가능합니다. 클립을 나눠서 적용하세요.")
     media = sorted((c for c in p["clips"] if not c["solid"]), key=lambda c: c["start"])
-    first = next((infos[c["src"]] for c in media if not infos[c["src"]].get("is_image")), None)         or (infos[media[0]["src"]] if media else {"width": 0, "height": 0, "fps": 30})
-    asp = p["output"]["aspect"]
-    if asp in ASPECTS:
-        w, h = ASPECTS[asp]
-    else:
-        w, h = (first["width"] // 2 * 2) or 1280, (first["height"] // 2 * 2) or 720
-    fps = int(min(60, max(15, round(first["fps"] or 30))))
+    first = next((infos[c["src"]] for c in media if not infos[c["src"]].get("is_image")), None) \
+        or (infos[media[0]["src"]] if media else {"width": 0, "height": 0, "fps": 30})
+    w, h = canvas_size(p, first)
+    fps = out_o["fps"] if out_o["fps"] != "auto" else int(min(60, max(15, round(first["fps"] or 30))))
     dur = max(total_duration(p), 0.1)
-    vtr, atr = p["tracks"]["v"], p["tracks"]["a"]
+    vtr = p["tracks"]["v"]
 
-    g = [f"color=c=black:s={w}x{h}:r={fps}:d={dur:.3f},format=yuv420p[b0]"]
+    gv: list[str] = []
+    ga: list[str] = []
     last = "b0"
-    layers = sorted((c for c in p["clips"] if not vtr[c["track"]]["hide"]), key=lambda c: (c["track"], c["start"]))
-    for n, c in enumerate(layers):
-        cd = clip_duration(c)
-        i = index.get(c["src"])
-        ov_in, ttype = overlap_in(p, c), (c["trans"] or {}).get("type")
-        sw, sh = max(2, round(w * c["scale"] / 2) * 2), max(2, round(h * c["scale"] / 2) * 2)
-        if c["solid"]:
-            sd = c["solid"]
-            sw, sh = max(2, round(w * sd["w"] * c["scale"] / 2) * 2), max(2, round(h * sd["h"] * c["scale"] / 2) * 2)
-            f = f"color=c=0x{sd['color'][1:]}:s={sw}x{sh}:r={fps}:d={cd:.3f},format=yuva420p"
-            if sd["shape"] == "ellipse":
-                f += (",geq=lum='p(X,Y)':cb='p(X,Y)':cr='p(X,Y)':"
-                      "a='if(lte(pow((X-W/2)/(W/2),2)+pow((Y-H/2)/(H/2),2),1),255,0)'")
-        elif c["freeze"]:
-            f = (f"[{i}:v]trim=start={c['in']:.3f}:end={c['in'] + 1:.3f},setpts=PTS-STARTPTS,select='eq(n,0)',"
-                 f"tpad=stop_mode=clone:stop_duration={c['hold']:.3f},trim=duration={cd:.3f},setpts=PTS-STARTPTS")
-        else:
-            f = (f"[{i}:v]trim=start={c['in']:.3f}:end={c['out']:.3f},"
-                 f"setpts=(PTS-STARTPTS)/{c['speed']:.5f}")
-        if not c["solid"]:
-            f += f",fps={fps},scale={sw}:{sh}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1"
-        fin = ov_in if ttype == "fade" and ov_in > 0 else c["fade_in"]
-        fout = c["fade_out"]
-        fades = []
-        if fin > 0:
-            fades.append(f"fade=t=in:st=0:d={min(fin, cd):.3f}:alpha=1")
-        if fout > 0:
-            fades.append(f"fade=t=out:st={max(0.0, cd - fout):.3f}:d={min(fout, cd):.3f}:alpha=1")
-        if fades or c["opacity"] < 0.999 or c["image"] or c["solid"]:
-            f += ",format=yuva420p" + "".join("," + x for x in fades)
-            if c["opacity"] < 0.999:
-                f += f",format=rgba,colorchannelmixer=aa={c['opacity']:.3f}"
-        else:
-            f += ",format=yuv420p"
-        f += f",setpts=PTS+{c['start']:.3f}/TB[l{n}]"
-        g.append(f)
-        dx, dy = ("", "")
-        if ttype in TRANS_TYPES and ttype != "fade" and ov_in > 0:
-            dx, dy = _slide(ttype, w, h, c["start"], ov_in)
-        x = f"W*{c['x']:.4f}-w/2{dx}"
-        y = f"H*{c['y']:.4f}-h/2{dy}"
-        g.append(f"[{last}][l{n}]overlay=x='{x}':y='{y}':eof_action=pass:"
-                 f"enable='between(t,{c['start']:.3f},{c['start'] + cd:.3f})':format=auto[b{n + 1}]")
-        last = f"b{n + 1}"
+    ass = None
+    if fmt != "mp3":
+        gv.append(f"color=c=black:s={w}x{h}:r={fps}:d={dur:.3f},format=yuv420p[b0]")
+        layers = sorted((c for c in p["clips"] if not vtr[c["track"]]["hide"]),
+                        key=lambda c: (c["track"], c["start"]))
+        for n, c in enumerate(layers):
+            last = _layer(p, c, n, last, gv, index, w, h, fps)
+        if p["subs"] or p["texts"]:
+            ass = build_ass(p, w, h)
+            gv.append(f"[{last}]ass=sub.ass:fontsdir=fonts[vout]")
+            last = "vout"
+        if fmt == "gif":
+            gv.append(f"[{last}]fps=12,scale=w='min(480,iw)':h=-2:flags=lanczos,split[g0][g1];[g0]palettegen[gp];"
+                      "[g1][gp]paletteuse[gifout]")
+            last = "gifout"
 
-    # 소리: 모든 클립/오디오를 자기 시작 시간만큼 늦춰서 섞는다.
+    if fmt != "gif":
+        _audio(p, infos, index, use, dur, ga)
+    amap = "[am]" if ga and ga[-1].endswith("[am]") else "[ab]"
+    graph = ";".join(gv if fmt == "gif" else ga if fmt == "mp3" else gv + ga)
+    return {"project": p, "graph": graph, "vgraph": ";".join(gv), "inputs": inputs, "size": (w, h), "duration": dur,
+            "ass": ass, "vmap": f"[{last}]", "amap": amap, "format": fmt, "fps": fps,
+            "ext": {"mp4": ".mp4", "gif": ".gif", "mp3": ".mp3"}[fmt]}
+
+
+MAX_REVERSE = 120
+
+
+def _layer(p: dict, c: dict, n: int, last: str, g: list[str], index: dict, w: int, h: int, fps: int) -> str:
+    cd = clip_duration(c)
+    i = index.get(c["src"])
+    ov_in, ttype = overlap_in(p, c), (c["trans"] or {}).get("type")
+    fit = c["fit"] or ("cover" if p["output"]["fill"] and not (c["solid"] or c["image"]) else "contain")
+    ratio = "increase" if fit == "cover" else "decrease"
+    anim = {k: len(c["kf"]) > 0 for k in ("x", "y", "scale", "opacity")}
+    sc_expr = pw_expr(kf_points(c, "scale"), "t") if anim["scale"] else None
+    sw, sh = max(2, round(w * c["scale"] / 2) * 2), max(2, round(h * c["scale"] / 2) * 2)
+    if c["solid"]:
+        sd = c["solid"]
+        bw, bh = w * sd["w"], h * sd["h"]
+        sw, sh = max(2, round(bw * c["scale"] / 2) * 2), max(2, round(bh * c["scale"] / 2) * 2)
+        f = f"color=c=0x{sd['color'][1:]}:s={sw}x{sh}:r={fps}:d={cd:.3f},format=yuva420p"
+        if sc_expr:
+            f += f",scale=w='max(2,trunc({bw:.2f}*({sc_expr})/2)*2)':h='max(2,trunc({bh:.2f}*({sc_expr})/2)*2)':eval=frame"
+        if sd["shape"] == "ellipse":
+            f += (",geq=lum='p(X,Y)':cb='p(X,Y)':cr='p(X,Y)':"
+                  "a='if(lte(pow((X-W/2)/(W/2),2)+pow((Y-H/2)/(H/2),2),1),255,0)'")
+    elif c["freeze"]:
+        f = (f"[{i}:v]trim=start={c['in']:.3f}:end={c['in'] + 1:.3f},setpts=PTS-STARTPTS,select='eq(n,0)',"
+             f"tpad=stop_mode=clone:stop_duration={c['hold']:.3f},trim=duration={cd:.3f},setpts=PTS-STARTPTS")
+    else:
+        f = f"[{i}:v]trim=start={c['in']:.3f}:end={c['out']:.3f},setpts=PTS-STARTPTS"
+        if c["reverse"]:
+            f += ",reverse,setpts=PTS-STARTPTS"
+        f += f",setpts=PTS/{c['speed']:.5f}"
+    if not c["solid"]:
+        f += f",fps={fps}"
+        pre = []
+        if c["flip_h"]:
+            pre.append("hflip")
+        if c["flip_v"]:
+            pre.append("vflip")
+        pre += {0: [], 90: ["transpose=1"], 180: ["hflip", "vflip"], 270: ["transpose=2"]}[c["rotate"]]
+        if pre:
+            f += "," + ",".join(pre)
+        if sc_expr:
+            f += (f",scale=w='max(2,trunc({w}*({sc_expr})/2)*2)':h='max(2,trunc({h}*({sc_expr})/2)*2)':"
+                  f"force_original_aspect_ratio={ratio}:eval=frame,setsar=1")
+        else:
+            f += f",scale={sw}:{sh}:force_original_aspect_ratio={ratio}:force_divisible_by=2,setsar=1"
+    # 색 보정 / 흑백 / 흐림
+    needs_alpha = c["image"] or bool(c["solid"])
+    if needs_alpha:
+        f += ",format=yuva420p"
+    eqs = []
+    if abs(c["brightness"]) > 1e-3:
+        eqs.append(f"brightness={c['brightness']:.3f}")
+    if abs(c["contrast"] - 1) > 1e-3:
+        eqs.append(f"contrast={c['contrast']:.3f}")
+    if abs(c["saturation"] - 1) > 1e-3:
+        eqs.append(f"saturation={c['saturation']:.3f}")
+    if eqs:
+        f += ",eq=" + ":".join(eqs)
+    if c["gray"]:
+        f += ",hue=s=0"
+    if c["blur"] > 0.05:
+        f += f",gblur=sigma={c['blur']:.2f}"
+    # 페이드 / 투명도
+    fin = ov_in if ttype == "fade" and ov_in > 0 else c["fade_in"]
+    fout = c["fade_out"]
+    fades = []
+    if fin > 0:
+        fades.append(f"fade=t=in:st=0:d={min(fin, cd):.3f}:alpha=1")
+    if fout > 0:
+        fades.append(f"fade=t=out:st={max(0.0, cd - fout):.3f}:d={min(fout, cd):.3f}:alpha=1")
+    static_op = c["opacity"] < 0.999 and not anim["opacity"]
+    if fades or static_op or anim["opacity"] or needs_alpha:
+        f += ",format=yuva420p" + "".join("," + x for x in fades)
+        if anim["opacity"]:
+            oe = pw_expr(kf_points(c, "opacity"), "T")
+            f += f",format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*clip({oe},0,1)'"
+        elif static_op:
+            f += f",format=rgba,colorchannelmixer=aa={c['opacity']:.3f}"
+    else:
+        f += ",format=yuv420p"
+    f += f",setpts=PTS+{c['start']:.3f}/TB[l{n}]"
+    g.append(f)
+    dx, dy = ("", "")
+    if ttype in TRANS_TYPES and ttype != "fade" and ov_in > 0:
+        dx, dy = _slide(ttype, w, h, c["start"], ov_in)
+    xv = pw_expr(kf_points(c, "x", c["start"]), "t") if anim["x"] else f"{c['x']:.4f}"
+    yv = pw_expr(kf_points(c, "y", c["start"]), "t") if anim["y"] else f"{c['y']:.4f}"
+    g.append(f"[{last}][l{n}]overlay=x='W*({xv})-w/2{dx}':y='H*({yv})-h/2{dy}':eof_action=pass:"
+             f"enable='between(t,{c['start']:.3f},{c['start'] + cd:.3f})':format=auto[b{n + 1}]")
+    return f"b{n + 1}"
+
+
+def _audio(p: dict, infos: dict, index: dict, use, dur: float, g: list[str]) -> None:
+    """소리: 모든 클립/오디오를 자기 시작 시간만큼 늦춰서 섞는다. 마지막 줄이 [am] 또는 [ab] 로 끝난다."""
+    vtr, atr = p["tracks"]["v"], p["tracks"]["a"]
     g.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={dur:.3f},asetpts=PTS-STARTPTS[ab]")
     mixin = ["[ab]"]
-
     for a in p["audios"]:
         use(a["src"])
     voices = voice_intervals(p, infos)
@@ -532,7 +668,7 @@ def build_plan(project: dict, resolve, probe_fn) -> dict:
         cd = clip_duration(c)
         tempo = atempo_chain(c["speed"])
         f = (f"[{index[c['src']]}:a]atrim=start={c['in']:.3f}:end={c['out']:.3f},asetpts=PTS-STARTPTS,"
-             + (tempo + "," if tempo else "") + f"volume={c['volume']:.3f}")
+             + ("areverse," if c["reverse"] else "") + (tempo + "," if tempo else "") + f"volume={c['volume']:.3f}")
         fin = max(c["fade_in"], overlap_in(p, c))
         fout = max(c["fade_out"], overlap_out(p, c))
         if fin > 0:
@@ -542,7 +678,7 @@ def build_plan(project: dict, resolve, probe_fn) -> dict:
         tail(f, c["start"], k)
         k += 1
     for a in p["audios"]:
-        j = use(a["src"])
+        j = index[a["src"]]
         if not infos[a["src"]]["has_audio"]:
             raise EditError(f"오디오가 없는 파일입니다: {a['src']}")
         if atr[a["track"]]["mute"]:
@@ -565,19 +701,6 @@ def build_plan(project: dict, resolve, probe_fn) -> dict:
         if p["output"]["loudnorm"]:
             mix += ",loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000,aformat=channel_layouts=stereo"
         g.append(mix + "[am]")
-        amap = "[am]"
-    else:
-        amap = "[ab]"
-
-    ass = None
-    if p["subs"] or p["texts"]:
-        ass = build_ass(p, w, h)
-        g.append(f"[{last}]ass=sub.ass:fontsdir=fonts[vout]")
-        vmap = "[vout]"
-    else:
-        vmap = f"[{last}]"
-    return {"project": p, "graph": ";".join(g), "inputs": inputs, "size": (w, h), "duration": dur,
-            "ass": ass, "vmap": vmap, "amap": amap}
 
 
 def atr_muted(vtr: list[dict], track: int) -> bool:
@@ -603,16 +726,38 @@ def prepare_workdir(plan: dict, work: Path, app_dir: Path) -> None:
                 break
 
 
-def build_command(plan: dict, out_path: Path, app_dir: Path) -> list[str]:
+def build_command(plan: dict, out_path: Path, app_dir: Path, cover: Path | None = None) -> list[str]:
     cmd = [find_tool("ffmpeg", app_dir), "-hide_banner", "-nostdin", "-y"]
     for path in plan["inputs"]:
         cmd += ["-i", path]
+    if cover:
+        cmd += ["-i", str(cover)]
     # 명령줄 길이 제한(윈도우 약 3만 자)을 넘는 긴 그래프만 파일로 전달한다. (ffmpeg 7 이상의 -/옵션 문법)
     graph = ["-/filter_complex", "graph.txt"] if len(plan["graph"]) > 20000 else ["-filter_complex", plan["graph"]]
-    return cmd + graph + ["-map", plan["vmap"], "-map", plan["amap"],
-                  "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
-                  "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
-                  "-progress", "pipe:1", "-nostats", str(out_path)]
+    o = plan["project"]["output"]
+    tail = ["-progress", "pipe:1", "-nostats", str(out_path)]
+    if plan["format"] == "mp3":
+        return cmd + graph + ["-map", plan["amap"], "-c:a", "libmp3lame", "-q:a", "2"] + tail
+    if plan["format"] == "gif":
+        return cmd + graph + ["-map", plan["vmap"], "-loop", "0"] + tail
+    maps = ["-map", plan["vmap"], "-map", plan["amap"]]
+    extra: list[str] = []
+    if cover:
+        k = len(plan["inputs"])
+        maps += ["-map", f"{k}:v"]
+        extra = ["-c:v:1", "mjpeg", "-disposition:v:1", "attached_pic"]
+    return cmd + graph + maps + ["-c:v:0", "libx264", "-preset", "veryfast", "-crf", str(CRF[o["quality"]]),
+                                 "-pix_fmt", "yuv420p", "-r", str(plan["fps"]), "-c:a", "aac", "-b:a", "192k",
+                                 "-movflags", "+faststart"] + extra + tail
+
+
+def frame_command(plan: dict, t: float, out_path: Path, app_dir: Path) -> list[str]:
+    """타임라인의 t 초 화면 한 장(PNG)을 만드는 명령. 영상 부분 그래프만 쓴다."""
+    cmd = [find_tool("ffmpeg", app_dir), "-hide_banner", "-nostdin", "-y"]
+    for path in plan["inputs"]:
+        cmd += ["-i", path]
+    return cmd + ["-filter_complex", plan["vgraph"], "-map", plan["vmap"], "-ss", f"{t:.3f}", "-frames:v", "1",
+                  str(out_path)]
 
 
 def unique_path(d: Path, name: str, ext: str = ".mp4") -> Path:
@@ -728,24 +873,41 @@ def make_router(app_dir: Path, media_dir, jobs: dict, lock: threading.Lock) -> A
     def api_srt_format(body: dict):
         return {"text": format_srt(body.get("subs") or [])}
 
+    export_lock = threading.Lock()   # 내보내기는 한 번에 하나씩 (일괄 내보내기는 줄을 서서 차례로)
+
     def run_export(jid: str, plan: dict, work: Path, tmp: Path, final: Path) -> None:
         job = jobs[jid]
         proc = None
         try:
-            prepare_workdir(plan, work, app_dir)
-            log = (work / "ffmpeg.log").open("w", encoding="utf-8", errors="replace")
-            proc = subprocess.Popen(build_command(plan, tmp, app_dir), cwd=work, stdout=subprocess.PIPE, stderr=log,
-                                    text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW)
-            total = max(plan["duration"], 0.1)
-            for line in proc.stdout:
+            with export_lock:
                 if job["cancel"]:
-                    proc.kill()
-                    break
-                m = re.match(r"out_time_(?:us|ms)=(\d+)", line)
-                if m:
-                    job["percent"] = round(min(99.0, int(m.group(1)) / 1e6 / total * 100), 1)
-            proc.wait()
-            log.close()
+                    job["status"] = "cancelled"
+                    return
+                job["stage"] = "Export"
+                prepare_workdir(plan, work, app_dir)
+                cover = None
+                cov_t = plan["project"]["output"]["cover_t"]
+                if cov_t is not None and plan["format"] == "mp4":
+                    cover = work / "cover.jpg"
+                    fr = subprocess.run(frame_command(plan, min(cov_t, max(plan["duration"] - 0.05, 0)), cover, app_dir),
+                                        cwd=work, capture_output=True, check=False, creationflags=CREATE_NO_WINDOW,
+                                        timeout=300)
+                    if fr.returncode != 0 or not cover.is_file():
+                        cover = None
+                log = (work / "ffmpeg.log").open("w", encoding="utf-8", errors="replace")
+                proc = subprocess.Popen(build_command(plan, tmp, app_dir, cover), cwd=work, stdout=subprocess.PIPE,
+                                        stderr=log, text=True, encoding="utf-8", errors="replace",
+                                        creationflags=CREATE_NO_WINDOW)
+                total = max(plan["duration"], 0.1)
+                for line in proc.stdout:
+                    if job["cancel"]:
+                        proc.kill()
+                        break
+                    m = re.match(r"out_time_(?:us|ms)=(\d+)", line)
+                    if m:
+                        job["percent"] = round(min(99.0, int(m.group(1)) / 1e6 / total * 100), 1)
+                proc.wait()
+                log.close()
             if job["cancel"]:
                 job["status"] = "cancelled"
                 tmp.unlink(missing_ok=True)
@@ -756,7 +918,7 @@ def make_router(app_dir: Path, media_dir, jobs: dict, lock: threading.Lock) -> A
             else:
                 tmp.replace(final)
                 job.update(status="done", percent=100, title=final.name, output=final.name)
-        except (EditError, OSError) as e:
+        except (EditError, OSError, subprocess.TimeoutExpired) as e:
             job.update(status="error", error=str(e))
             if proc and proc.poll() is None:
                 proc.kill()
@@ -765,12 +927,11 @@ def make_router(app_dir: Path, media_dir, jobs: dict, lock: threading.Lock) -> A
             job["finished"] = time.time()
             shutil.rmtree(work, ignore_errors=True)
 
-    @r.post("/export")
-    def api_export(body: dict):
-        plan = guard(lambda: build_plan(body, resolve, pr))
+    def start_export(project: dict, suffix: str = "") -> dict:
+        plan = guard(lambda: build_plan(project, resolve, pr))
         d = media_dir()
-        final = unique_path(d, plan["project"]["name"])
-        tmp = d / f"{final.stem}.temp.mp4"
+        final = unique_path(d, plan["project"]["name"] + suffix, plan["ext"])
+        tmp = d / f"{final.stem}.temp{plan['ext']}"
         work = app_dir / "edit_work" / uuid.uuid4().hex[:8]
         jid = uuid.uuid4().hex[:8]
         with lock:
@@ -779,5 +940,43 @@ def make_router(app_dir: Path, media_dir, jobs: dict, lock: threading.Lock) -> A
                          "error": None, "cancel": False, "started": time.time(), "finished": None, "mode": "edit"}
         threading.Thread(target=run_export, args=(jid, plan, work, tmp, final), daemon=True).start()
         return {"id": jid, "output": final.name}
+
+    @r.post("/export")
+    def api_export(body: dict):
+        batch = [a for a in (body.get("batch") or []) if a in ASPECTS][:3]
+        if not batch:
+            return start_export(body)
+        # 일괄 내보내기: 비율마다 따로 만든다 (먼저 모두 검사한 뒤 시작)
+        projects_ = []
+        for a in batch:
+            pj = json.loads(json.dumps(body))
+            pj["output"] = {**(pj.get("output") or {}), "aspect": a}
+            guard(lambda pj=pj: build_plan(pj, resolve, pr))
+            projects_.append((pj, "_" + a.replace(":", "x")))
+        res = [start_export(pj, sfx) for pj, sfx in projects_]
+        return {"id": res[0]["id"], "output": ", ".join(x["output"] for x in res), "jobs": res}
+
+    @r.post("/frame")
+    def api_frame(body: dict):
+        """현재 화면 한 장을 PNG 로 저장한다 (자막/겹침/효과 모두 반영)."""
+        t = _num(body.get("t"), 0, 0, 1e5)
+        project = json.loads(json.dumps(body.get("project") or {}))
+        project["output"] = {**(project.get("output") or {}), "format": "mp4"}
+        plan = guard(lambda: build_plan(project, resolve, pr))
+        d = media_dir()
+        final = unique_path(d, f"{plan['project']['name']}_화면_{int(t // 60):02d}분{int(t % 60):02d}초", ".png")
+        work = app_dir / "edit_work" / uuid.uuid4().hex[:8]
+        try:
+            prepare_workdir(plan, work, app_dir)
+            res = subprocess.run(frame_command(plan, min(t, max(plan["duration"] - 0.05, 0)), final, app_dir), cwd=work,
+                                 capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
+                                 creationflags=CREATE_NO_WINDOW, timeout=300)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise HTTPException(500, f"화면을 저장하지 못했습니다: {e}") from e
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        if res.returncode != 0 or not final.is_file():
+            raise HTTPException(500, "화면을 저장하지 못했습니다: " + " / ".join(res.stderr.strip().splitlines()[-3:])[-250:])
+        return {"output": final.name}
 
     return r

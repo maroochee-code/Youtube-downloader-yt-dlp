@@ -301,3 +301,89 @@ def test_duck_and_loudnorm(media, tmp_path):
     assert editor.merge_spans([(0, 1), (1.2, 2), (5, 6)]) == [(0, 2), (5, 6)]
     spans = [(i * 3.0, i * 3.0 + 1) for i in range(100)]
     assert len(editor.merge_spans(spans)) <= editor.DUCK_MAX_SPANS
+
+
+# ---------- v1.3: 효과 / 키프레임 / 채우기 / 내보내기 설정 ----------
+def test_pw_expr_and_normalize_kf():
+    e = editor.pw_expr([(0, 0.0), (2, 1.0)], "t")
+    assert "clip((t-0.000)/2.000,0,1)" in e and e.startswith("if(lt(t,2.000)")
+    assert editor.pw_expr([(0, 0.4)], "t") == "0.40000"
+    n = editor.normalize({"clips": [{"src": "a", "in": 0, "out": 2, "rotate": 450, "blur": 99,
+                                     "kf": [{"t": 1, "x": 0.2}, {"t": 0, "x": 0.8}, {"t": 1, "x": 0.5}]}]})
+    c = n["clips"][0]
+    assert [k["t"] for k in c["kf"]] == [0, 1] and c["kf"][1]["x"] == 0.5
+    assert c["rotate"] in (0, 90, 180, 270) and c["blur"] == 30
+
+
+def test_effects_flip_rotate_reverse(media, tmp_path):
+    out = export(media, tmp_path, {"name": "fx", "version": 2, "output": {"aspect": "16:9"}, "clips": [
+        {"src": "a.mp4", "track": 0, "start": 0, "in": 0, "out": 2, "brightness": 0.2, "contrast": 1.3, "saturation": 0,
+         "blur": 3, "flip_h": True, "rotate": 90},
+        {"src": "a.mp4", "track": 0, "start": 2, "in": 0, "out": 2, "reverse": True, "gray": True, "fit": "cover"}]})
+    info = ffprobe_of(out)
+    assert info["duration"] == pytest.approx(4.0, abs=0.3) and info["has_audio"]
+
+
+def test_reverse_limit():
+    fake = {"duration": 300.0, "has_video": True, "has_audio": True, "width": 640, "height": 360, "fps": 30,
+            "is_image": False}
+    with pytest.raises(editor.EditError, match="역재생"):
+        editor.build_plan({"clips": [{"src": "x.mp4", "in": 0, "out": 200, "reverse": True}]}, lambda s_: Path(s_), lambda _p: fake)
+    plan = editor.build_plan({"clips": [{"src": "x.mp4", "in": 0, "out": 100, "reverse": True}]}, lambda s_: Path(s_), lambda _p: fake)
+    assert "reverse" in plan["graph"] and "areverse" in plan["graph"]
+
+
+def test_cover_fill_vs_contain(pics, tmp_path):
+    base = {"version": 2, "output": {"aspect": "9:16"}, "clips": [
+        {"src": "a.mp4", "track": 0, "start": 0, "in": 0, "out": 2}]}
+    plain = export(pics, tmp_path, {**base, "name": "contain"})
+    fill = export(pics, tmp_path, {**base, "name": "fill", "output": {"aspect": "9:16", "fill": True}})
+    top = "1080:200:0:0"      # 위쪽 검은 띠 자리
+    assert sum(mean_color(plain, 1.0, tmp_path, top)) < 30
+    assert sum(mean_color(fill, 1.0, tmp_path, top)) > 60
+
+
+def test_keyframes_move_and_opacity(media, tmp_path):
+    p = {"name": "kf", "version": 2, "output": {"aspect": "16:9"}, "clips": [
+        {"src": "a.mp4", "track": 0, "start": 0, "in": 0, "out": 4},
+        {"solid": {"shape": "rect", "color": "#ff0000", "w": 0.2, "h": 0.2}, "track": 1, "start": 0, "hold": 4,
+         "kf": [{"t": 0, "x": 0.1, "y": 0.5, "scale": 1, "opacity": 1}, {"t": 4, "x": 0.9, "y": 0.5, "scale": 2, "opacity": 1}]}]}
+    out = export(media, tmp_path, p)
+    left = mean_color(out, 0.2, tmp_path, "100:100:100:470")
+    right = mean_color(out, 3.8, tmp_path, "100:100:1700:470")
+    assert left[0] > 200 and left[1] < 60 and right[0] > 200 and right[1] < 60
+    mid = mean_color(out, 0.2, tmp_path, "100:100:1700:470")
+    assert not (mid[0] > 200 and mid[1] < 60)
+    p["clips"][1]["kf"] = [{"t": 0, "x": 0.5, "y": 0.5, "scale": 1, "opacity": 0}, {"t": 4, "x": 0.5, "y": 0.5, "scale": 1, "opacity": 1}]
+    out2 = export(media, tmp_path, {**p, "name": "kf2"})
+    assert ffprobe_of(out2)["duration"] == pytest.approx(4.0, abs=0.3)
+
+
+def test_output_options_gif_mp3_size(media, tmp_path):
+    base = {"version": 2, "clips": [{"src": "a.mp4", "track": 0, "start": 0, "in": 0, "out": 2}]}
+    out = export(media, tmp_path, {**base, "name": "small", "output": {"aspect": "16:9", "size": 360, "quality": "small", "fps": 24}})
+    info = ffprobe_of(out)
+    assert (info["width"], info["height"]) == (640, 360) and info["fps"] == pytest.approx(24, abs=0.5)
+    mp3 = export(media, tmp_path, {**base, "name": "aud", "output": {"format": "mp3"}})
+    assert mp3.suffix == ".mp3" and ffprobe_of(mp3)["has_audio"] and not ffprobe_of(mp3)["has_video"]
+    gif = export(media, tmp_path, {**base, "name": "ani", "output": {"format": "gif"}})
+    assert gif.suffix == ".gif" and ffprobe_of(gif)["has_video"]
+
+
+def test_cover_image_and_frame_capture_and_batch(media, tmp_path):
+    client, jobs = make_client(media, tmp_path)
+    base = {"name": "cov", "version": 2, "clips": [{"src": "a.mp4", "track": 0, "start": 0, "in": 0, "out": 3}],
+            "output": {"cover_t": 1.5}}
+    r = client.post("/api/edit/export", json=base)
+    assert wait_done(jobs, r.json()["id"])["status"] == "done"
+    probe_out = subprocess.run([editor.find_tool("ffprobe", APP_DIR), "-v", "error", "-show_entries", "stream=codec_name:stream_disposition=attached_pic",
+                                "-of", "json", str(media / r.json()["output"])], capture_output=True, text=True, check=False).stdout
+    assert "mjpeg" in probe_out and '"attached_pic": 1' in probe_out
+    fr = client.post("/api/edit/frame", json={"project": base, "t": 1.0})
+    assert fr.status_code == 200 and (media / fr.json()["output"]).stat().st_size > 1000
+    b = client.post("/api/edit/export", json={**base, "name": "bat", "output": {}, "batch": ["16:9", "9:16", "bogus"]})
+    res = b.json()["jobs"]
+    assert len(res) == 2 and {x["output"] for x in res} == {"bat_16x9.mp4", "bat_9x16.mp4"}
+    for x in res:
+        assert wait_done(jobs, x["id"])["status"] == "done"
+    assert ffprobe_of(media / "bat_9x16.mp4")["height"] == 1920

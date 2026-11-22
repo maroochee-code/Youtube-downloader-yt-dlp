@@ -84,7 +84,7 @@
 .blk span{pointer-events:none;overflow:hidden;text-overflow:ellipsis;position:relative;z-index:1}
 .blk canvas.wv{position:absolute;inset:2px 0;width:100%;height:calc(100% - 4px);pointer-events:none}
 .blk u.trn{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,rgba(255,255,255,.55),rgba(255,255,255,.1));text-decoration:none;pointer-events:none;border-right:1px dashed #fff}
-.ph{position:absolute;top:0;bottom:0;width:0;border-left:2px solid #ff4d4d;z-index:9;pointer-events:none}
+.ph{position:absolute;top:0;bottom:0;width:0;border-left:2px solid #ff4d4d;z-index:7;pointer-events:none}
 .ph:before{content:"";position:absolute;left:-7px;top:0;border:6px solid transparent;border-top:8px solid #ff4d4d}
 .snapline{position:absolute;top:0;bottom:0;width:0;border-left:1px dashed #ffd24d;z-index:9;pointer-events:none}
 .rb{position:absolute;border:1px solid var(--accent);background:rgba(80,140,255,.15);z-index:10;pointer-events:none}

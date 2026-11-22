@@ -483,7 +483,7 @@ const Editor = (() => {
         <span class="sep"></span><button id="edUndo" title="되돌리기 (Ctrl+Z)">↶</button><button id="edRedo" title="다시 실행 (Ctrl+Y)">↷</button>
         <span class="sep"></span><button id="edShot" title="재생선 위치 화면을 PNG 로 저장">📷 화면 저장</button><button id="edCover" title="재생선 위치를 mp4 표지로 지정">🖼 표지 지정</button>
         <span class="sep"></span><button id="edSnap" class="tg on" title="클립 가장자리에 자석처럼 붙기">🧲 자석</button><button id="edAddV" title="영상 줄 추가">＋영상 줄</button><button id="edAddA" title="오디오 줄 추가">＋오디오 줄</button>
-        <span style="flex:1"></span><span style="font-size:12px;color:var(--mute)">확대</span><input type="range" id="edZoom" min="8" max="160" value="${pps}">
+        <span style="flex:1"></span><span style="font-size:12px;color:var(--mute)">확대</span><button id="edFit" title="타임라인 전체가 한 화면에 보이게">전체 보기</button><input type="range" id="edZoom" min="1" max="200" value="${pps}" title="확대/축소 (Ctrl+마우스 휠도 됩니다)">
       </div>
       <div class="ed-tl"><div class="ed-scroll" id="edScroll"><div id="edInner"></div></div></div>`;
     Object.assign(R, {play: $('#edPlay'), msg: $('#edMsg'), stage: $('#edStage'), wrap: $('#edWrap'), ov: $('#edOv'),
@@ -505,7 +505,9 @@ const Editor = (() => {
     $('#edUndo').onclick = () => restore(undo, redo); $('#edRedo').onclick = () => restore(redo, undo);
     $('#edSnap').onclick = e => { snapOn = !snapOn; e.currentTarget.classList.toggle('on', snapOn); };
     $('#edAddV').onclick = () => addTrack('v'); $('#edAddA').onclick = () => addTrack('a');
-    $('#edZoom').oninput = e => { pps = +e.target.value; renderTimeline(); };
+    $('#edZoom').oninput = e => setZoom(+e.target.value);
+    $('#edFit').onclick = () => { const w = R.scroll.clientWidth - OFF - 30, tot = Math.max(total(), 1); setZoom(clamp(w / tot, 1, 200)); R.scroll.scrollLeft = 0; };
+    R.scroll.addEventListener('wheel', e => { if (!e.ctrlKey) return; e.preventDefault(); setZoom(clamp(pps * (e.deltaY < 0 ? 1.15 : 1 / 1.15), 1, 200), e.clientX); }, {passive: false});
     R.name.oninput = () => { P.name = R.name.value; queueSave(); };
     $('#edNew').onclick = () => { if ((P.clips.length || P.audios.length) && !confirm('지금 편집 중인 내용이 사라집니다. 새로 만들까요?')) return; pause(); P = blank(); clearSel(); undo = []; redo = []; try { localStorage.removeItem(AUTOKEY); } catch { /* 무시 */ } renderAll(); seek(0); };
     $('#edSave').onclick = saveProject; $('#edOpen').onclick = openDialog; $('#edExport').onclick = exportNow;
@@ -536,6 +538,17 @@ const Editor = (() => {
     say(miss.length ? `원본 파일을 찾을 수 없습니다: ${miss.map(nameOf).join(', ')}` : `열었습니다: ${P.name}`, !!miss.length);
   }
 
+  /* 확대/축소: 재생선(또는 마우스 위치)이 화면에서 움직이지 않게 기준점을 잡는다 */
+  function setZoom(np, anchorX) {
+    const sc = R.scroll, sr = sc.getBoundingClientRect(), old = pps;
+    let ax = anchorX ?? sr.left + OFF + (T * old - sc.scrollLeft);
+    if (anchorX === undefined && (ax < sr.left + OFF || ax > sr.right)) ax = sr.left + OFF + (sr.width - OFF) / 2;   // 재생선이 화면 밖이면 가운데 기준
+    const t = (ax - sr.left + sc.scrollLeft - OFF) / old;
+    pps = Math.round(np * 100) / 100;
+    const z = $('#edZoom'); if (z && +z.value !== Math.round(pps)) z.value = Math.round(pps);
+    renderTimeline();
+    sc.scrollLeft = Math.max(0, OFF + t * pps - (ax - sr.left));
+  }
   function renderAll() { renderBar(); renderLeft(); renderTimeline(); renderProps(); renderStage(); renderOv(); renderTime(); }
   function renderLight() { renderTimeline(); renderStage(); renderOv(); renderTime(); }
   function renderBar() { if (document.activeElement !== R.name) R.name.value = P.name; }

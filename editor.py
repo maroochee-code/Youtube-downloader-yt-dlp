@@ -226,7 +226,7 @@ def normalize(project: dict) -> dict:
             "brightness": _num(c.get("brightness"), 0, -1, 1), "contrast": _num(c.get("contrast"), 1, 0, 3),
             "saturation": _num(c.get("saturation"), 1, 0, 3), "gray": bool(c.get("gray")),
             "blur": _num(c.get("blur"), 0, 0, 30), "flip_h": bool(c.get("flip_h")), "flip_v": bool(c.get("flip_v")),
-            "rotate": int(_num(c.get("rotate"), 0, 0, 270)) // 90 * 90 % 360,
+            "rotate": int(_num(c.get("rotate"), 0, 0, 270)) // 90 * 90 % 360, "angle": _num(c.get("angle"), 0, -360, 360),
             "reverse": bool(c.get("reverse")) and not freeze, "kf": _kf(c.get("kf")),
             "link": c.get("link") or None})
     if not out["clips"]:
@@ -722,7 +722,8 @@ def _layer(p: dict, c: dict, n: int, last: str, g: list[str], index: dict, w: in
         else:
             f += f",scale={sw}:{sh}:force_original_aspect_ratio={ratio}:force_divisible_by=2,setsar=1"
     # 색 보정 / 흑백 / 흐림
-    needs_alpha = c["image"] or bool(c["solid"])
+    rot_a = abs(c["angle"]) > 0.05
+    needs_alpha = c["image"] or bool(c["solid"]) or rot_a
     if needs_alpha:
         f += ",format=yuva420p"
     eqs = []
@@ -738,6 +739,9 @@ def _layer(p: dict, c: dict, n: int, last: str, g: list[str], index: dict, w: in
         f += ",hue=s=0"
     if c["blur"] > 0.05:
         f += f",gblur=sigma={c['blur']:.2f}"
+    if rot_a:
+        f += (f",format=rgba,rotate=a={math.radians(c['angle']):.5f}:ow='ceil(hypot(iw,ih)/2)*2':"
+              "oh='ceil(hypot(iw,ih)/2)*2':c=none")
     # 페이드 / 투명도
     fin = ov_in if ttype == "fade" and ov_in > 0 else c["fade_in"]
     fout = c["fade_out"]

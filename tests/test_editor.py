@@ -417,3 +417,12 @@ def test_export_with_effects(media, tmp_path):
         "subs": [{"start": 0, "end": 3, "text": "타이핑 자막", "fx": {"in": "typing", "out": "fade", "box": True}}],
         "texts": [{"start": 0, "end": 3, "text": "흐르는 글자", "x": 0.5, "y": 0.2, "fx": {"loop": "marquee-l"}}]})
     assert ffprobe_of(out)["duration"] == pytest.approx(3.0, abs=0.3)
+
+
+def test_free_rotation_angle(media, tmp_path):
+    p = {"name": "rot", "version": 2, "output": {"aspect": "16:9"}, "clips": [
+        {"solid": {"shape": "rect", "color": "#ff0000", "w": 0.5, "h": 0.1}, "track": 0, "start": 0, "hold": 2, "angle": 90}]}
+    out = export(media, tmp_path, p)
+    # 가로로 긴 막대를 90도 돌렸으니 중앙 세로축에는 빨강, 가로 끝(왼쪽 위쪽)은 검정
+    assert mean_color(out, 1.0, tmp_path, "40:200:940:100")[0] > 200
+    assert sum(mean_color(out, 1.0, tmp_path, "100:40:400:520")) < 40

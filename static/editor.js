@@ -8,11 +8,14 @@ const Editor = (() => {
   const fmt = t => { t = Math.max(0, t); const m = Math.floor(t / 60); return `${String(m).padStart(2, '0')}:${(t - m * 60).toFixed(1).padStart(4, '0')}`; };
   const srcUrl = s => '/api/edit/media?src=' + encodeURIComponent(s);
   const OFF = 96, MAXTR = 8, AUTOKEY = 'ytdl_edit_autosave';
-  const FX0 = () => ({fit: null, brightness: 0, contrast: 1, saturation: 1, gray: false, blur: 0, flip_h: false, flip_v: false, rotate: 0, reverse: false, kf: []});
+  const FX0 = () => ({angle: 0, fit: null, brightness: 0, contrast: 1, saturation: 1, gray: false, blur: 0, flip_h: false, flip_v: false, rotate: 0, reverse: false, kf: []});
   const track0 = () => ({mute: false, lock: false, hide: false});
+  const FX0S = () => ({in: 'none', in_dur: 0.5, out: 'none', out_dur: 0.4, loop: 'none', kara: false, kara_color: '#ffd24d', box: false, box_color: '#000000', box_opacity: 0.6});
+  const FX_IN = [['none', '없음'], ['fade', '페이드'], ['typing', '타이핑'], ['pop', '팝업(통통)'], ['slide-l', '왼쪽에서 슬라이드'], ['slide-r', '오른쪽에서 슬라이드'], ['slide-u', '위에서 슬라이드'], ['slide-d', '아래에서 슬라이드'], ['blur', '흐림에서 또렷하게'], ['zoom', '줌인']];
+  const FX_LOOP = [['none', '없음'], ['shake', '흔들림'], ['float', '둥둥'], ['marquee-l', '흐르는 자막 ← (오른쪽에서 왼쪽)'], ['marquee-r', '흐르는 자막 → (왼쪽에서 오른쪽)']];
   const blank = () => ({version: 2, name: '편집본', tracks: {v: [track0(), track0()], a: [track0(), track0()]},
     clips: [], audios: [], subs: [], texts: [], markers: [], range: {in: null, out: null},
-    sub_style: {size: 48, color: '#ffffff', outline: '#000000', pos: 'bottom'}, output: {aspect: 'original', loudnorm: false}});
+    sub_style: {size: 48, color: '#ffffff', outline: '#000000', pos: 'bottom', fx: FX0S()}, output: {aspect: 'original', loudnorm: false}});
   const TRANS = [['', '없음'], ['fade', '디졸브(서서히 겹침)'], ['slide-l', '오른쪽에서 밀려 들어옴'], ['slide-r', '왼쪽에서 밀려 들어옴'], ['slide-u', '아래에서 밀려 들어옴'], ['slide-d', '위에서 밀려 들어옴']];
 
   let P = blank(), sel = null, multi = new Set(), T = 0, playing = false, pps = 40, tab = 'video', snapOn = true;
@@ -77,6 +80,9 @@ const Editor = (() => {
 
   function fixProject(d) {  // 저장본/자동저장본의 빠진 값 채우기
     const b = blank(), o = Object.assign(b, d);
+    o.sub_style = {...blank().sub_style, ...(d.sub_style || {}), fx: {...FX0S(), ...(d.sub_style?.fx || {})}};
+    o.subs = (d.subs || []).map(x => ({...x, fx: x.fx ? {...FX0S(), ...x.fx} : null}));
+    o.texts = (d.texts || []).map(x => ({...x, fx: {...FX0S(), ...(x.fx || {})}}));
     o.version = 2; o.markers = Array.isArray(d.markers) ? d.markers : []; o.range = {in: null, out: null, ...(d.range || {})}; o.output = {aspect: 'original', loudnorm: false, ...(d.output || {})};
     const tr = (arr, n) => { arr = Array.isArray(arr) ? arr.map(t => ({...track0(), ...t})) : []; while (arr.length < n) arr.push(track0()); return arr; };
     o.clips = (o.clips || []).map((c, i) => ({track: 0, start: 0, speed: 1, volume: 1, mute: false, x: .5, y: .5, scale: 1, opacity: 1, fade_in: 0, fade_out: 0, trans: null, freeze: false, image: false, solid: null, hold: 2, link: null, group: null, ...FX0(), id: uid(), ...c}));
@@ -145,12 +151,12 @@ const Editor = (() => {
   }
   function addSub() {
     const id = uid();
-    mutate(() => P.subs.push({id, start: +T.toFixed(2), end: +(T + 2).toFixed(2), text: '새 자막'}));
+    mutate(() => P.subs.push({id, start: +T.toFixed(2), end: +(T + 2).toFixed(2), text: '새 자막', fx: null}));
     setSel([{type: 'sub', o: find('sub', id)}]); renderAll();
   }
   function addText() {
     const id = uid();
-    mutate(() => P.texts.push({id, start: +T.toFixed(2), end: +(T + 3).toFixed(2), text: '글자', x: 0.5, y: 0.15, size: 64, color: '#ffffff'}));
+    mutate(() => P.texts.push({id, start: +T.toFixed(2), end: +(T + 3).toFixed(2), text: '글자', x: 0.5, y: 0.15, size: 64, color: '#ffffff', fx: FX0S()}));
     setSel([{type: 'text', o: find('text', id)}]); renderAll();
   }
   function addSolid(shape) {
@@ -285,12 +291,28 @@ const Editor = (() => {
     const c = sel?.type === 'clip' ? selObj() : null;
     if (!c) { say('소리를 분리할 영상 클립을 먼저 선택하세요.', true); return; }
     if (c.freeze || c.mute || !info[c.src]?.has_audio) { say('분리할 소리가 없는 클립입니다.', true); return; }
-    const lid = uid(), id = uid();
+    const id = uid();
     mutate(() => {
-      P.audios.push({id, src: c.src, track: firstFree('a'), start: c.start, in: c.in, out: c.out, speed: c.speed, volume: c.volume, fade_in: c.fade_in, fade_out: c.fade_out, link: lid});
-      c.mute = true; c.link = lid;
+      P.audios.push({id, src: c.src, track: firstFree('a'), start: c.start, in: c.in, out: c.out, speed: c.speed, volume: c.volume, fade_in: c.fade_in, fade_out: c.fade_out, duck: false, duck_level: .25, link: null, group: null});
+      c.mute = true;
     });
-    setSel([{type: 'audio', o: find('audio', id)}]); renderAll(); ensureWave(c.src); say('소리를 오디오 줄로 분리했습니다. 영상 클립은 소리가 꺼졌고, 둘은 연결돼 같이 움직입니다.');
+    setSel([{type: 'audio', o: find('audio', id)}]); renderAll(); ensureWave(c.src); say('소리를 오디오 줄로 분리했습니다. 영상은 소리가 꺼졌고, 소리는 따로 움직입니다. (같이 움직이게 하려면 🔗 연결)');
+  }
+  function linkSel() {
+    const items = selItems(), by = (a, b) => Math.abs(a.start - b.start);
+    let c = items.find(i => i.type === 'clip' && !i.o.solid)?.o, a = items.find(i => i.type === 'audio')?.o;
+    if (!c && a) c = P.clips.filter(x => !x.solid && x.src === a.src).sort((x, y) => by(x, a) - by(y, a))[0];
+    if (!a && c) a = P.audios.filter(x => x.src === c.src).sort((x, y) => by(x, c) - by(y, c))[0];
+    if (!c || !a) { say('연결할 영상 클립과 오디오를 Shift 로 함께 선택한 뒤 눌러 주세요. (같은 파일이면 하나만 선택해도 자동으로 찾습니다)', true); return; }
+    const lid = c.link || a.link || uid();
+    mutate(() => { c.link = lid; a.link = lid; });
+    say('연결했습니다. 🔗 둘은 같이 움직이고, 지우거나 나눌 때도 같이 처리됩니다.');
+  }
+  function unlinkSel() {
+    const ids = new Set(selItems().map(i => i.o.link).filter(Boolean));
+    if (!ids.size) { say('선택한 항목에 연결이 없습니다.', true); return; }
+    mutate(() => { for (const x of [...P.clips, ...P.audios]) if (ids.has(x.link)) x.link = null; });
+    say('연결을 해제했습니다. 이제 따로 움직입니다.');
   }
   function freezeFrame() {
     const cands = sel?.type === 'clip' ? [selObj()] : P.clips.filter(c => !locked('clip', c) && T > c.start + 0.05 && T < cend(c) - 0.05);
@@ -378,7 +400,7 @@ const Editor = (() => {
       const swp = R.stage.clientWidth, shp = R.stage.clientHeight, kk = parseFloat(R.stage.style.getPropertyValue('--k')) || .4, rot = c.rotate || 0;
       const rs = rot % 180 ? Math.min(swp / shp, shp / swp) : 1;
       el.style.opacity = op;
-      el.style.transform = `translate(${tx * swp / 100}px,${ty * shp / 100}px) scale(${kv.scale * rs}) rotate(${rot}deg) scale(${c.flip_h ? -1 : 1},${c.flip_v ? -1 : 1})`;
+      el.style.transform = `translate(${tx * swp / 100}px,${ty * shp / 100}px) scale(${kv.scale * rs}) rotate(${rot + (c.angle || 0)}deg) scale(${c.flip_h ? -1 : 1},${c.flip_v ? -1 : 1})`;
       const fl = [];
       if (c.brightness) fl.push(`brightness(${Math.max(0, 1 + c.brightness)})`);
       if ((c.contrast ?? 1) !== 1) fl.push(`contrast(${c.contrast})`);
@@ -446,7 +468,7 @@ const Editor = (() => {
       <div class="ed-main">
         <div class="ed-left"><div class="ed-ltabs" id="edLtabs"></div><div class="ed-lbody" id="edLbody"></div></div>
         <div class="ed-center">
-          <div class="ed-wrap" id="edWrap"><div id="edStage"><div id="edOv"></div><div class="empty" id="edEmpty">왼쪽 목록에서 영상을 눌러 추가하세요<br>(타임라인으로 끌어다 놓아도 됩니다)</div></div></div>
+          <div class="ed-wrap" id="edWrap"><div id="edStage"><div id="edOv"></div><div class="guide gv" id="edGv" hidden></div><div class="guide gh" id="edGh" hidden></div><div id="edBox" hidden><i class="rot" data-h="rot"></i><i data-h="nw"></i><i data-h="ne"></i><i data-h="sw"></i><i data-h="se"></i><i class="edge" data-h="n"></i><i class="edge" data-h="s"></i><i class="edge" data-h="e"></i><i class="edge" data-h="w"></i></div><div class="empty" id="edEmpty">왼쪽 목록에서 영상을 눌러 추가하세요<br>(타임라인으로 끌어다 놓아도 됩니다)</div></div></div>
           <div class="ed-ctl"><button id="edToStart" title="처음으로">⏮</button><button id="edPlay" title="재생/정지 (Space)">▶</button><span id="edTime">00:00.0 / 00:00.0</span>
             <span class="sep"></span><button id="edIn" title="구간 시작 (I)">I</button><button id="edOut" title="구간 끝 (O)">O</button><button id="edLoop" class="tg" title="구간 반복 재생 (L). 구간은 I/O 로 지정, X 로 해제">🔁</button><button id="edMark" title="재생선에 마커 (M)">⚑</button>
             <input id="edGo" type="text" placeholder="이동 1:23.5" size="9" title="시간을 입력하고 Enter"><button id="edFull" title="미리보기 전체 화면">⛶</button></div>
@@ -457,7 +479,7 @@ const Editor = (() => {
         <button id="edSplit" title="나누기 (S)">✂ 나누기</button><button id="edDel" title="삭제 (Delete)">🗑 삭제</button><button id="edRip" title="삭제하고 뒤를 당기기 (Shift+Delete)">⇤ 당겨서 삭제</button>
         <span class="sep"></span><button id="edCopy" title="복사 (Ctrl+C)">복사</button><button id="edPaste" title="재생선 위치에 붙여넣기 (Ctrl+V)">붙여넣기</button><button id="edDup" title="복제 (Ctrl+D)">복제</button>
         <span class="sep"></span><button id="edGroup" title="선택한 항목 묶기 (Ctrl+G)">묶기</button><button id="edUngroup" title="묶음 풀기 (Ctrl+Shift+G)">풀기</button>
-        <span class="sep"></span><button id="edDetach" title="영상 클립의 소리를 오디오 줄로 분리">🔊 소리 분리</button><button id="edFreeze" title="재생선 위치를 멈춘 화면으로">❄ 정지 화면</button>
+        <span class="sep"></span><button id="edDetach" title="영상 클립의 소리를 오디오 줄로 분리">🔊 소리 분리</button><button id="edLink" title="영상과 오디오를 연결(같이 움직임)">🔗 연결</button><button id="edUnlink" title="연결 해제">연결 해제</button><button id="edFreeze" title="재생선 위치를 멈춘 화면으로">❄ 정지 화면</button>
         <span class="sep"></span><button id="edUndo" title="되돌리기 (Ctrl+Z)">↶</button><button id="edRedo" title="다시 실행 (Ctrl+Y)">↷</button>
         <span class="sep"></span><button id="edShot" title="재생선 위치 화면을 PNG 로 저장">📷 화면 저장</button><button id="edCover" title="재생선 위치를 mp4 표지로 지정">🖼 표지 지정</button>
         <span class="sep"></span><button id="edSnap" class="tg on" title="클립 가장자리에 자석처럼 붙기">🧲 자석</button><button id="edAddV" title="영상 줄 추가">＋영상 줄</button><button id="edAddA" title="오디오 줄 추가">＋오디오 줄</button>
@@ -467,11 +489,13 @@ const Editor = (() => {
     Object.assign(R, {play: $('#edPlay'), msg: $('#edMsg'), stage: $('#edStage'), wrap: $('#edWrap'), ov: $('#edOv'),
       inner: $('#edInner'), scroll: $('#edScroll'), props: $('#edProps'), lbody: $('#edLbody'), time: $('#edTime'), name: $('#edName')});
     new ResizeObserver(fitStage).observe(R.wrap);
+    $('#edBox').addEventListener('pointerdown', e => boxDown(e, e.target.dataset.h || 'move'));
+    R.stage.addEventListener('pointerdown', stageDown);
     $('#edPlay').onclick = () => (playing ? pause() : play());
     $('#edToStart').onclick = () => { pause(); seek(0); };
     $('#edSplit').onclick = split; $('#edDel').onclick = () => removeSelected(false); $('#edRip').onclick = () => removeSelected(true);
     $('#edCopy').onclick = copySel; $('#edPaste').onclick = () => pasteAt(T); $('#edDup').onclick = duplicateSel;
-    $('#edDetach').onclick = detachAudio; $('#edFreeze').onclick = freezeFrame;
+    $('#edDetach').onclick = detachAudio; $('#edLink').onclick = linkSel; $('#edUnlink').onclick = unlinkSel; $('#edFreeze').onclick = freezeFrame;
     $('#edShot').onclick = saveShot; $('#edCover').onclick = () => { mutate(() => { P.output.cover_t = +T.toFixed(2); }, false); renderProps(); say(`표지로 지정: ${fmt(T)} 화면 (mp4 내보내기에 들어갑니다)`); };
     $('#edGroup').onclick = groupSel; $('#edUngroup').onclick = ungroupSel;
     $('#edIn').onclick = () => setRange('in'); $('#edOut').onclick = () => setRange('out'); $('#edMark').onclick = addMarker;
@@ -543,11 +567,12 @@ const Editor = (() => {
       const st = P.sub_style;
       b.innerHTML = `<div class="btns"><button data-act="addSub">＋ 현재 위치에 자막</button><button data-act="srtIn">SRT 불러오기</button><button data-act="srtOut">SRT 내보내기</button><input type="file" id="edSrtFile" accept=".srt,.txt" hidden></div>
         ${[...P.subs].sort((x, y) => x.start - y.start).map(s => `<div class="row srow ${multi.has(s.id) ? 'on' : ''}" data-sel="sub" data-id="${s.id}"><div style="min-width:0"><div class="t">${esc(s.text)}</div><div class="m">${fmt(s.start)} → ${fmt(s.end)}</div></div></div>`).join('') || '<div class="hint">자막이 없습니다.</div>'}
-        <div class="sty"><span>크기</span><input type="number" data-sty="size" value="${st.size}" min="10" max="200">
+        <div class="sty"><span>크기</span><div class="sl"><input type="range" data-sty="size" value="${st.size}" min="10" max="200"><input type="number" data-sty="size" value="${st.size}" min="10" max="200"></div>
         <span>글자색</span><input type="color" data-sty="color" value="${st.color}"><span>테두리색</span><input type="color" data-sty="outline" value="${st.outline}">
-        <span>위치</span><select data-sty="pos">${[['bottom', '아래'], ['middle', '가운데'], ['top', '위']].map(([k, n]) => `<option value="${k}" ${st.pos === k ? 'selected' : ''}>${n}</option>`).join('')}</select></div>`;
+        <span>위치</span><select data-sty="pos">${[['bottom', '아래'], ['middle', '가운데'], ['top', '위']].map(([k, n]) => `<option value="${k}" ${st.pos === k ? 'selected' : ''}>${n}</option>`).join('')}</select></div>
+        <div class="hint" style="padding-bottom:0"><b>자막 공통 연출</b> (자막마다 따로 바꾸려면 자막을 선택하세요)</div>${fxHtml(st.fx, 'data-sfx')}`;
     } else {
-      b.innerHTML = `<div class="btns"><button data-act="addText">＋ 현재 위치에 글자</button></div>
+      b.innerHTML = `<div class="btns"><button data-act="addText">＋ 현재 위치에 글자</button></div><div class="hint" style="padding-top:0">글자를 선택하면 오른쪽에서 연출을 고르고, 미리보기에서 끌어 위치/크기를 바꿀 수 있습니다.</div>
         ${P.texts.map(s => `<div class="row srow ${multi.has(s.id) ? 'on' : ''}" data-sel="text" data-id="${s.id}"><div style="min-width:0"><div class="t">${esc(s.text)}</div><div class="m">${fmt(s.start)} → ${fmt(s.end)}</div></div></div>`).join('') || '<div class="hint">글자가 없습니다.</div>'}`;
     }
   }
@@ -587,8 +612,36 @@ const Editor = (() => {
       e.target.value = '';
     }
   });
+  const fxSel = (key, opts, cur, attr) => `<select ${attr}="${key}">${opts.map(([v, n]) => `<option value="${v}" ${cur === v ? 'selected' : ''}>${n}</option>`).join('')}</select>`;
+  function fxHtml(fx, attr) {   // attr: 'data-fx' (선택한 항목) / 'data-sfx' (자막 공통)
+    const sl = (key, lo, hi, st, val, pct) => `<div class="sl"><input type="range" ${attr}="${key}" data-fxt="${pct ? 'p' : 'n'}" min="${lo}" max="${hi}" step="${st}" value="${pct ? Math.round(val * 100) : val}"><input type="number" ${attr}="${key}" data-fxt="${pct ? 'p' : 'n'}" step="${st}" value="${pct ? Math.round(val * 100) : val}"></div>`;
+    return `<div class="f fxf"><label>등장</label>${fxSel('in', FX_IN, fx.in, attr)}
+      <label>등장 시간(초)</label>${sl('in_dur', 0.1, 3, 0.1, fx.in_dur)}
+      <label>퇴장</label>${fxSel('out', [['none', '없음'], ['fade', '페이드']], fx.out, attr)}
+      <label>퇴장 시간(초)</label>${sl('out_dur', 0.1, 3, 0.1, fx.out_dur)}
+      <label>움직임</label>${fxSel('loop', FX_LOOP, fx.loop, attr)}
+      <label>노래방 채우기</label><span><input type="checkbox" ${attr}="kara" ${fx.kara ? 'checked' : ''}> <input type="color" ${attr}="kara_color" value="${fx.kara_color}"></span>
+      <label>배경 박스</label><span><input type="checkbox" ${attr}="box" ${fx.box ? 'checked' : ''}> <input type="color" ${attr}="box_color" value="${fx.box_color}"></span>
+      <label>박스 진하기(%)</label>${sl('box_opacity', 0, 100, 5, fx.box_opacity, true)}</div>
+      <div class="note" style="margin-top:4px">흐르는 자막은 길이가 길수록 천천히 흐릅니다. 타이핑은 등장 시간 동안 글자가 차례로 나타납니다.</div>`;
+  }
+  function fxValue(el) {
+    return el.type === 'checkbox' ? el.checked : el.dataset.fxt === 'p' ? num(el.value) / 100 : el.dataset.fxt === 'n' ? num(el.value) : el.value;
+  }
+  function fxInput(el, scope, e) {
+    const key = el.dataset.fx || el.dataset.sfx, val = fxValue(el);
+    if (scope === 'item') {
+      const o = selObj(); if (!o) return;
+      mutate(() => { if (!o.fx) o.fx = {...FX0S(), ...P.sub_style.fx}; o.fx[key] = val; }, e.type === 'change' || el.tagName === 'SELECT', 'fx' + key);
+      if (e.type === 'change') renderProps();
+    } else {
+      mutate(() => { P.sub_style.fx[key] = val; }, false, 'sfx' + key);
+    }
+  }
   function onStyleInput(e) {
     if (e.target.dataset.shapecolor !== undefined) { shapeColor = e.target.value; return; }
+    const sw = e.target.closest('.sl'); if (sw) for (const o2 of sw.querySelectorAll('input')) if (o2 !== e.target) o2.value = e.target.value;
+    if (e.target.dataset.sfx) { fxInput(e.target, 'style', e); return; }
     const k = e.target.dataset.sty; if (!k) return;
     mutate(() => { P.sub_style[k] = k === 'size' ? clamp(num(e.target.value, 48), 10, 200) : e.target.value; }, false, 'sty' + k);
   }
@@ -601,7 +654,7 @@ const Editor = (() => {
   }
 
   /* 오른쪽 속성 패널 */
-  const LAYER = [['x', '가로 위치(%)', 'p'], ['y', '세로 위치(%)', 'p'], ['scale', '크기(%)', 'p'], ['opacity', '투명도(%)', 'p']];
+  const LAYER = [['x', '가로 위치(%)', 'p'], ['y', '세로 위치(%)', 'p'], ['scale', '크기(%)', 'p'], ['opacity', '투명도(%)', 'p'], ['angle', '회전(°)', 'n']];
   const EFFECTS = [['fit', '화면 맞춤', 's'], ['rotate', '회전', 's'], ['flip_h', '좌우 반전', 'b'], ['flip_v', '상하 반전', 'b'], ['brightness', '밝기(%)', 'p'], ['contrast', '대비(%)', 'p'], ['saturation', '채도(%)', 'p'], ['gray', '흑백', 'b'], ['blur', '흐림(0~30)', 'n']];
   const OPTS = {
     'solid.shape': [['rect', '사각형'], ['ellipse', '원/타원']],
@@ -620,8 +673,15 @@ const Editor = (() => {
   const TITLES = {clip: '영상 클립', freeze: '정지 화면', image: '이미지', solid: '도형', audio: '오디오', sub: '자막', text: '글자'};
   const getv = (o, k) => (k.includes('.') ? k.split('.').reduce((a, b) => a?.[b], o) : o[k]);
   const setv = (o, k, v) => { if (k.includes('.')) { const [a, b] = k.split('.'); o[a][b] = v; } else o[k] = v; };
+  const RANGES = {volume: [0, 200, 5], opacity: [0, 100, 1], scale: [5, 300, 1], x: [-50, 150, 1], y: [-50, 150, 1], brightness: [-100, 100, 1], contrast: [0, 300, 5], saturation: [0, 300, 5], blur: [0, 30, 0.5],
+    fade_in: [0, 5, 0.1], fade_out: [0, 5, 0.1], speed: [0.25, 4, 0.25], duck_level: [0, 100, 5], 'solid.w': [1, 100, 1], 'solid.h': [1, 100, 1], angle: [-180, 180, 1], size: [10, 200, 1]};
   function fieldHtml(k, label, type, v) {
     let inp;
+    const rg = RANGES[k];
+    if (rg && (type === 'n' || type === 'p')) {
+      const dv = type === 'p' ? Math.round(v * 100) : +(+v).toFixed(3), st = type === 'n' && k !== 'speed' ? 0.1 : 5;
+      return `<label>${label}</label><div class="sl"><input type="range" min="${rg[0]}" max="${rg[1]}" step="${rg[2]}" data-k="${k}" data-t="${type}" value="${dv}"><input type="number" step="${rg[2] < 1 ? rg[2] : st}" data-k="${k}" data-t="${type}" value="${dv}"></div>`;
+    }
     if (type === 'n') inp = `<input type="number" step="${k === 'speed' ? 0.25 : 0.1}" data-k="${k}" data-t="n" value="${+(+v).toFixed(3)}">`;
     else if (type === 'p') inp = `<input type="number" step="5" data-k="${k}" data-t="p" value="${Math.round(v * 100)}">`;
     else if (type === 'b') inp = `<input type="checkbox" data-k="${k}" data-t="b" ${v ? 'checked' : ''}>`;
@@ -657,10 +717,12 @@ const Editor = (() => {
       extra = `<h4 style="margin-top:12px">장면 전환</h4><div class="f"><label>종류</label><select data-trans="type">${TRANS.map(([k, n]) => `<option value="${k}" ${(o.trans?.type || '') === k ? 'selected' : ''}>${n}</option>`).join('')}</select>
         <label>길이(초)</label><input type="number" step="0.1" min="0.1" data-trans="dur" value="${(o.trans ? ov : 0.5).toFixed(2)}" ${o.trans ? '' : 'disabled'}></div>
         <div class="note" style="margin-top:4px">${p ? '앞 클립과 겹친 길이가 전환 길이입니다.' : '같은 줄 앞에 클립이 있어야 전환을 넣을 수 있습니다.'}</div>
-        <div class="acts">${o.freeze ? '' : '<button data-do="setIn">현재 위치를 시작으로</button><button data-do="setOut">현재 위치를 끝으로</button><button data-do="detach">소리 분리</button>'}<button data-do="propcopy">속성 복사</button><button data-do="proppaste">속성 붙여넣기</button></div>
+        <div class="acts">${o.freeze ? '' : '<button data-do="setIn">현재 위치를 시작으로</button><button data-do="setOut">현재 위치를 끝으로</button><button data-do="detach">소리 분리</button>'}<button data-do="link">🔗 연결</button><button data-do="unlink">연결 해제</button><button data-do="propcopy">속성 복사</button><button data-do="proppaste">속성 붙여넣기</button></div>
         <div class="note">${o.freeze ? '' : `원본 길이 ${fmt(info[o.src]?.duration || 0)} · `}${esc(nameOf(o.src))}</div>`;
     }
-    if (sel.type === 'audio') extra = `<div class="note">${esc(nameOf(o.src))} · 원본 길이 ${fmt(info[o.src]?.duration || 0)}${o.link ? '<br>🔗 영상 클립과 연결됨(같이 움직임)' : ''}</div>`;
+    if (sel.type === 'sub') extra = `<h4 style="margin-top:12px">연출</h4>${o.fx ? fxHtml(o.fx, 'data-fx') + '<div class="acts"><button data-do="fxdefault">공통 연출 따르기</button></div>' : '<div class="note" style="margin-top:0">자막 탭의 공통 연출을 따릅니다. (현재: 등장 ' + esc(FX_IN.find(x => x[0] === P.sub_style.fx.in)?.[1] || '없음') + ')</div><div class="acts"><button data-do="fxown">이 자막만 따로 연출</button></div>'}`;
+    if (sel.type === 'text') extra = `<h4 style="margin-top:12px">연출</h4>${fxHtml(o.fx || FX0S(), 'data-fx')}`;
+    if (sel.type === 'audio') extra = `<div class="acts"><button data-do="link">🔗 영상과 연결</button><button data-do="unlink">연결 해제</button></div><div class="note">${esc(nameOf(o.src))} · 원본 길이 ${fmt(info[o.src]?.duration || 0)}${o.link ? '<br>🔗 영상 클립과 연결됨(같이 움직임)' : '<br>연결 안 됨 (따로 움직임)'}</div>`;
     const kvNow = sel.type === 'clip' ? kfEval(o, T) : null;
     const kfHtml = sel.type === 'clip' ? `<h4 style="margin-top:12px">키프레임 (움직임/크기/투명도 변화)</h4>
       <div class="acts" style="margin-top:0"><button data-do="kfadd">◆ 현재 위치에 키프레임</button><button data-do="kfclear">모두 지우기</button></div>
@@ -670,6 +732,8 @@ const Editor = (() => {
   }
   function onPropInput(e) {
     const el = e.target;
+    const slw = el.closest('.sl'); if (slw) for (const o2 of slw.querySelectorAll('input')) if (o2 !== el) o2.value = el.value;
+    if (el.dataset.fx) { fxInput(el, 'item', e); return; }
     if (el.dataset.proj) { if (el.type === 'checkbox' && e.type === 'input') return; mutate(() => { P.output[el.dataset.proj] = el.type === 'checkbox' ? el.checked : el.value; }); return; }
     if (el.dataset.mklabel) { const m = P.markers.find(x => x.id === el.dataset.mklabel); if (m) mutate(() => { m.label = el.value; }, false, 'mk' + m.id); return; }
     const o = selObj();
@@ -721,6 +785,10 @@ const Editor = (() => {
     if (d === 'copy') { copySel(); return; }
     if (d === 'dup') { duplicateSel(); return; }
     if (d === 'detach') { detachAudio(); return; }
+    if (d === 'fxown') { const o = selObj(); if (o) { mutate(() => { o.fx = {...FX0S(), ...P.sub_style.fx}; }); renderProps(); } return; }
+    if (d === 'fxdefault') { const o = selObj(); if (o) { mutate(() => { o.fx = null; }); renderProps(); } return; }
+    if (d === 'link') { linkSel(); return; }
+    if (d === 'unlink') { unlinkSel(); return; }
     const o = selObj(); if (!o || sel.type !== 'clip' || o.freeze) return;
     if (T < o.start || T > cend(o)) { say('재생선을 이 클립 위에 놓아 주세요.', true); return; }
     const at = o.in + (T - o.start) * o.speed;
@@ -744,15 +812,138 @@ const Editor = (() => {
     renderOv();
   }
   function renderStage() { $('#edEmpty').style.display = P.clips.length ? 'none' : 'flex'; fitStage(); }
+  const ease = u => 1 + 2.70158 * Math.pow(u - 1, 3) + 1.70158 * Math.pow(u - 1, 2);   // easeOutBack
+  const twEst = (text, size) => Math.max(...text.split('\n').map(l => [...l].reduce((a, ch) => a + (ch.charCodeAt(0) > 0x2e80 ? size : size * 0.55), 0)), 0);
+  function fxView(it, fx, k, SW, SH, size) {
+    const d = Math.max(it.end - it.start, 0.05), rel = T - it.start, left = it.end - T;
+    const inD = Math.min(fx.in_dur, d), pi = fx.in === 'none' ? 1 : clamp(rel / inD, 0, 1);
+    const po = fx.out === 'fade' ? clamp(left / Math.min(fx.out_dur, d), 0, 1) : 1;
+    let op = po, tr = '', blur = 0, text = it.text;
+    const mq = fx.loop.startsWith('marquee');
+    if (!mq) {
+      if (fx.in === 'fade') op *= pi;
+      else if (fx.in === 'pop') tr += ` scale(${0.45 + 0.55 * ease(pi) * 1.0})`;
+      else if (fx.in === 'zoom') { op *= pi; tr += ` scale(${2.3 - 1.3 * pi})`; }
+      else if (fx.in === 'blur') blur = (1 - pi) * 12 * k;
+      else if (fx.in.startsWith('slide')) { const q = 1 - pi, dx = {l: -SW * 0.45, r: SW * 0.45, u: 0, d: 0}[fx.in.slice(6)], dy = {l: 0, r: 0, u: -SH * 0.3, d: SH * 0.3}[fx.in.slice(6)]; tr += ` translate(${dx * q}px,${dy * q}px)`; }
+    }
+    if (fx.loop === 'shake') tr += ` rotate(${Math.sin(T * 45) * 2.2}deg)`;
+    if (fx.loop === 'float') tr += ` translateY(${Math.sin(T * 3) * 5 * k}px) rotate(${Math.sin(T * 3) * 1.4}deg)`;
+    let html = esc(text);
+    if (fx.in === 'typing' && !mq) {
+      const chars = [...text], vis = chars.filter(ch => ch !== ' ' && ch !== '\n').length, n = Math.floor(vis * pi + 1e-6);
+      let seen = 0, cut = 0; for (let i = 0; i < chars.length; i++) { if (chars[i] !== ' ' && chars[i] !== '\n') seen++; if (seen >= Math.max(n, 1)) { cut = i + 1; break; } }
+      if (n === 0) cut = 0;
+      html = esc(chars.slice(0, cut).join('')) + `<span style="opacity:0">${esc(chars.slice(cut).join(''))}</span>`;
+    } else if (fx.kara) {
+      const chars = [...text], vis = chars.filter(ch => ch !== '\n').length, fill = clamp(rel / (d * 0.85), 0, 1) * vis; let ci = 0;
+      html = chars.map(ch => (ch === '\n' ? '\n' : `<span style="color:${ci++ < fill ? fx.kara_color : 'inherit'}">${esc(ch)}</span>`)).join('');
+    }
+    const box = fx.box ? `background:rgba(${parseInt(fx.box_color.slice(1, 3), 16)},${parseInt(fx.box_color.slice(3, 5), 16)},${parseInt(fx.box_color.slice(5, 7), 16)},${fx.box_opacity});padding:${6 * k}px ${14 * k}px;text-shadow:none;` : '';
+    return {op, tr, blur, html, box, mq, mx: mq ? (fx.loop === 'marquee-l' ? SW + (-twEst(text, size) - SW) * clamp(rel / d, 0, 1) : -twEst(text, size) + (SW + twEst(text, size)) * clamp(rel / d, 0, 1)) : 0};
+  }
   function renderOv() {
-    const st = P.sub_style, k = parseFloat(R.stage.style.getPropertyValue('--k')) || .4;
+    const st = P.sub_style, k = parseFloat(R.stage.style.getPropertyValue('--k')) || .4, SW = R.stage.clientWidth, SH = R.stage.clientHeight;
     const subs = P.subs.filter(s => T >= s.start && T < s.end).map(s => {
-      const pos = st.pos === 'top' ? 'top:6%' : st.pos === 'middle' ? 'top:50%;transform:translateY(-50%)' : 'bottom:6%';
-      return `<div class="sub" style="${pos};font-size:${st.size * k}px;color:${st.color};text-shadow:0 0 ${3 * k}px ${st.outline},0 0 ${3 * k}px ${st.outline},0 0 ${3 * k}px ${st.outline}">${esc(s.text)}</div>`;
+      const fx = s.fx || st.fx, v = fxView(s, fx, k, SW, SH, st.size * k), pos = st.pos === 'top' ? 'top:6%' : st.pos === 'middle' ? 'top:50%' : 'bottom:6%';
+      const base = st.pos === 'middle' ? ' translateY(-50%)' : '';
+      const place = v.mq ? `left:0;right:auto;white-space:nowrap;transform:translateX(${v.mx}px)${base}` : `left:0;right:0;margin:0 auto;width:fit-content;max-width:90%;transform:${(base + v.tr).trim() || 'none'}`;
+      const shadow = fx.box ? '' : `text-shadow:0 0 ${3 * k}px ${st.outline},0 0 ${3 * k}px ${st.outline},0 0 ${3 * k}px ${st.outline};`;
+      return `<div class="sub" style="${pos};${place};opacity:${v.op};filter:blur(${v.blur}px);font-size:${st.size * k}px;color:${st.color};${shadow}${v.box}">${v.html}</div>`;
     });
-    const txts = P.texts.filter(s => T >= s.start && T < s.end).map(s =>
-      `<div class="txt" style="left:${s.x * 100}%;top:${s.y * 100}%;font-size:${s.size * k}px;color:${s.color}">${esc(s.text)}</div>`);
+    const txts = P.texts.filter(s => T >= s.start && T < s.end).map(s => {
+      const fx = s.fx || FX0S(), v = fxView(s, fx, k, SW, SH, s.size * k);
+      const place = v.mq ? `left:0;top:${s.y * 100}%;transform:translate(${v.mx}px,-50%)` : `left:${s.x * 100}%;top:${s.y * 100}%;transform:translate(-50%,-50%)${v.tr}`;
+      return `<div class="txt" data-oid="${s.id}" data-otype="text" style="${place};opacity:${v.op};filter:blur(${v.blur}px);font-size:${s.size * k}px;color:${s.color};${v.box}">${v.html}</div>`;
+    });
     R.ov.innerHTML = subs.join('') + txts.join('');
+    renderBox();
+  }
+  /* ---- 미리보기 손잡이: 끌어서 이동, 모서리로 크기, 위쪽 동그라미로 회전 ---- */
+  function boxOfClip(c) {
+    const SW = R.stage.clientWidth, SH = R.stage.clientHeight, kv = kfEval(c, T);
+    let bw, bh;
+    if (c.solid) { bw = c.solid.w * SW * kv.scale; bh = c.solid.h * SH * kv.scale; }
+    else {
+      const i = info[c.src]; let w0 = i?.width || SW, h0 = i?.height || SH; if ((c.rotate || 0) % 180) [w0, h0] = [h0, w0];
+      const sa = w0 / h0, fa = SW / SH, cover = (c.fit || (P.output.fill && !c.image ? 'cover' : 'contain')) === 'cover';
+      let cw, ch; if ((sa > fa) !== cover) { cw = SW; ch = SW / sa; } else { ch = SH; cw = SH * sa; }
+      bw = cw * kv.scale; bh = ch * kv.scale;
+    }
+    return {cx: kv.x * SW, cy: kv.y * SH, w: bw, h: bh, rot: c.angle || 0};
+  }
+  function boxTarget() {
+    const o = multi.size === 1 ? selObj() : null; if (!o || !sel) return null;
+    if (sel.type === 'clip') { if (T < o.start || T >= cend(o) || P.tracks.v[o.track]?.hide) return null; return {type: 'clip', o, ...boxOfClip(o)}; }
+    if (sel.type === 'text') {
+      if (T < o.start || T >= o.end) return null;
+      const el = R.ov.querySelector(`[data-oid="${o.id}"]`); if (!el) return null;
+      const r = el.getBoundingClientRect(), s0 = R.stage.getBoundingClientRect();
+      return {type: 'text', o, cx: r.left - s0.left + r.width / 2, cy: r.top - s0.top + r.height / 2, w: r.width, h: r.height, rot: 0};
+    }
+    return null;
+  }
+  function renderBox() {
+    const b = $('#edBox'); if (!b) return;
+    const t = playing ? null : boxTarget();
+    if (!t) { b.hidden = true; return; }
+    b.hidden = false;
+    Object.assign(b.style, {left: t.cx - t.w / 2 + 'px', top: t.cy - t.h / 2 + 'px', width: t.w + 'px', height: t.h + 'px', transform: `rotate(${t.rot}deg)`});
+    b.dataset.kind = t.type === 'clip' && t.o.solid ? 'solid' : t.type;
+  }
+  function boxDown(e, mode) {
+    e.preventDefault(); e.stopPropagation(); pause();
+    const t = boxTarget(); if (!t) return;
+    const o = t.o, sr = R.stage.getBoundingClientRect(), SW = sr.width, SH = sr.height, gv = $('#edGv'), gh = $('#edGh');
+    const pt = ev => ({x: ev.clientX - sr.left, y: ev.clientY - sr.top}), p0 = pt(e), before = JSON.stringify(P);
+    const kv0 = t.type === 'clip' ? kfEval(o, T) : null;
+    const orig = t.type === 'clip' ? {x: kv0.x, y: kv0.y, scale: kv0.scale, opacity: kv0.opacity, sw: o.solid?.w, sh: o.solid?.h} : {x: o.x, y: o.y, size: o.size};
+    const ang = t.rot * Math.PI / 180, loc = p => { const dx = p.x - t.cx, dy = p.y - t.cy; return {x: dx * Math.cos(-ang) - dy * Math.sin(-ang), y: dx * Math.sin(-ang) + dy * Math.cos(-ang)}; };
+    const d0 = Math.hypot(loc(p0).x, loc(p0).y) || 1;
+    const mv = ev => {
+      const p = pt(ev), dx = p.x - p0.x, dy = p.y - p0.y, ratio = Math.hypot(loc(p).x, loc(p).y) / d0;
+      let nx = t.cx + dx, ny = t.cy + dy; gv.hidden = gh.hidden = true;
+      if (mode === 'move') {
+        if (Math.abs(nx - SW / 2) < 7) { nx = SW / 2; gv.hidden = false; }
+        if (Math.abs(ny - SH / 2) < 7) { ny = SH / 2; gh.hidden = false; }
+      }
+      if (t.type === 'clip') {
+        const cur = {x: orig.x, y: orig.y, scale: orig.scale, opacity: orig.opacity};
+        if (mode === 'move') { cur.x = nx / SW; cur.y = ny / SH; }
+        else if (mode === 'rot') { let a = Math.atan2(p.y - t.cy, p.x - t.cx) * 180 / Math.PI + 90; if (ev.shiftKey) a = Math.round(a / 15) * 15; o.angle = +(((a + 540) % 360) - 180).toFixed(1); }
+        else if (o.solid && mode.length === 1) { const l = loc(p); if (mode === 'e' || mode === 'w') o.solid.w = clamp(2 * Math.abs(l.x) / (SW * orig.scale), 0.01, 1); else o.solid.h = clamp(2 * Math.abs(l.y) / (SH * orig.scale), 0.01, 1); }
+        else if (mode.length === 2) cur.scale = clamp(orig.scale * ratio, 0.05, 5);
+        if (mode === 'move' || mode.length === 2) { if (o.kf?.length) upsertKf(o, cur); else { o.x = cur.x; o.y = cur.y; o.scale = cur.scale; } }
+      } else if (mode === 'move') { o.x = clamp(nx / SW, 0, 1); o.y = clamp(ny / SH, 0, 1); }
+      else if (mode.length === 2) o.size = clamp(Math.round(orig.size * ratio), 10, 300);
+      syncPreview(true); renderOv();
+    };
+    const up = () => {
+      removeEventListener('pointermove', mv); removeEventListener('pointerup', up); gv.hidden = gh.hidden = true;
+      if (JSON.stringify(P) !== before) { undo.push(before); if (undo.length > 100) undo.shift(); redo = []; lastKey = ''; queueSave(); }
+      renderAll();
+    };
+    addEventListener('pointermove', mv); addEventListener('pointerup', up);
+  }
+  function stageDown(e) {
+    if (e.button !== 0 || e.target.closest('#edBox')) return;
+    const sr = R.stage.getBoundingClientRect();
+    let hit = null;
+    for (const el of [...R.ov.querySelectorAll('[data-oid]')].reverse()) {
+      const r = el.getBoundingClientRect();
+      if (e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom) { const o = find('text', el.dataset.oid); if (o && !locked('text', o)) { hit = {type: 'text', o}; break; } }
+    }
+    if (!hit) {
+      for (const c of layers().reverse()) {
+        if (T < c.start || T >= cend(c) || P.tracks.v[c.track]?.hide || locked('clip', c)) continue;
+        const b = boxOfClip(c), a = -b.rot * Math.PI / 180, dx = e.clientX - sr.left - b.cx, dy = e.clientY - sr.top - b.cy;
+        const lx = dx * Math.cos(a) - dy * Math.sin(a), ly = dx * Math.sin(a) + dy * Math.cos(a);
+        if (Math.abs(lx) <= b.w / 2 && Math.abs(ly) <= b.h / 2) { hit = {type: 'clip', o: c}; break; }
+      }
+    }
+    if (!hit) { if (sel || multi.size) { clearSel(); renderAll(); } return; }
+    if (!multi.has(hit.o.id) || multi.size !== 1) { setSel([hit]); renderAll(); }
+    boxDown(e, 'move');
   }
   const renderTime = () => { R.time.textContent = `${fmt(T)} / ${fmt(total())}`; };
 
@@ -1032,6 +1223,6 @@ const Editor = (() => {
     async addFromLibrary(name) { if (!built) build(); await loadLib(); await addClip(name); },
     refreshLib: loadLib,
     _state: () => ({P, T, sel, multi: [...multi], info, vels: vels.size}),  // 테스트용
-    _do: {addKf, kfEval, saveShot, exportNow, addSolid, setRange, addMarker, groupSel, ungroupSel, copyProps, pasteProps, toggleRec, voiceSpans, duckGain, split, freezeFrame, detachAudio, copySel, pasteAt, duplicateSel, removeSelected, setTransition, seek, play, pause, addClip, addAudio, setSel, find, renderAll},  // 테스트용
+    _do: {linkSel, unlinkSel, boxTarget, boxDown, stageDown, addKf, kfEval, saveShot, exportNow, addSolid, setRange, addMarker, groupSel, ungroupSel, copyProps, pasteProps, toggleRec, voiceSpans, duckGain, split, freezeFrame, detachAudio, copySel, pasteAt, duplicateSel, removeSelected, setTransition, seek, play, pause, addClip, addAudio, setSel, find, renderAll},  // 테스트용
   };
 })();

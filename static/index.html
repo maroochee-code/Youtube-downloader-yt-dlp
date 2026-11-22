@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>YT 다운로더</title>
+<link rel="stylesheet" href="/static/editor.css">
 <style>
 :root{--bg:#f4f4f1;--panel:#fff;--side:#f1efe8;--text:#1f1f1d;--sub:#5f5e5a;--mute:#8a8984;--line:#dcdad2;--accent:#185fa5;--on:#fff;--danger:#a32d2d;--ok:#3b6d11;--soft:#e6f1fb}
 :root[data-theme=dark]{--bg:#1b1b1a;--panel:#242422;--side:#20201f;--text:#ecebe6;--sub:#b4b2a9;--mute:#888780;--line:#3a3a37;--accent:#85b7eb;--on:#042c53;--danger:#f09595;--ok:#97c459;--soft:#0c2a45;color-scheme:dark}
@@ -92,7 +93,10 @@ dialog .df{padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8
 </head>
 <body>
 <header>
-  <b>YT 다운로더</b>
+  <span class="tabs">
+    <button id="tabDl" class="on">다운로드</button>
+    <button id="tabEdit">편집</button>
+  </span>
   <span style="display:flex;align-items:center">
     <button class="ico" id="btnSettings" title="설정">⚙</button>
     <span class="menu">
@@ -110,6 +114,7 @@ dialog .df{padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8
 
 <div id="upd" class="upd" style="display:none"></div>
 
+<div id="viewDl" class="view">
 <section class="addr">
   <div class="addrbox">
     <span style="color:var(--accent);font-size:18px">🔗&#xFE0E;</span>
@@ -178,6 +183,9 @@ dialog .df{padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8
     </div>
   </aside>
 </div>
+</div>
+
+<div id="viewEdit" class="view" hidden></div>
 
 <footer id="jobs">대기 중</footer>
 
@@ -318,7 +326,15 @@ $('#btnDl').onclick = download;
 /* 진행률 */
 let pollTimer = null, hadActive = false;
 const hinted = new Set();
-const stageName = {FFmpegExtractAudio: '음원 변환', Merger: '영상·음성 병합', FFmpegMerger: '영상·음성 병합', EmbedThumbnail: '썸네일 내장', FFmpegMetadata: '메타데이터 내장', FFmpegEmbedSubtitle: '자막 내장', ModifyChapters: '구간 편집', SponsorBlock: 'SponsorBlock'};
+const stageName = {FFmpegExtractAudio: '음원 변환', Merger: '영상·음성 병합', FFmpegMerger: '영상·음성 병합', EmbedThumbnail: '썸네일 내장', FFmpegMetadata: '메타데이터 내장', FFmpegEmbedSubtitle: '자막 내장', ModifyChapters: '구간 편집', SponsorBlock: 'SponsorBlock', Export: '편집 영상 만드는 중'};
+function showView(v) {
+  const edit = v === 'edit';
+  $('#viewDl').hidden = edit; $('#viewEdit').hidden = !edit;
+  $('#tabDl').classList.toggle('on', !edit); $('#tabEdit').classList.toggle('on', edit);
+  if (edit) Editor.show(); else Editor.hide();
+}
+$('#tabDl').onclick = () => showView('dl');
+$('#tabEdit').onclick = () => showView('edit');
 async function pollJobs() {
   clearTimeout(pollTimer);
   let js = [];
@@ -329,7 +345,7 @@ async function pollJobs() {
   $('#jobs').innerHTML = show.length ? show.map(j => {
     let s;
     if (j.status === 'downloading') s = `${j.percent}% · ${j.speed ? fmtSize(j.speed) + '/s' : ''} ${j.eta != null ? '· 남은 ' + fmtDur(j.eta) : ''}`;
-    else if (j.status === 'processing') s = stageName[j.stage] || '처리 중…';
+    else if (j.status === 'processing') s = (stageName[j.stage] || '처리 중…') + (j.stage === 'Export' ? ` ${j.percent}%` : '');
     else if (j.status === 'done') s = '완료';
     else if (j.status === 'cancelled') s = '취소됨';
     else if (j.status === 'error') s = j.error;
@@ -357,7 +373,8 @@ async function loadLib() {
       <div class="item ${it.name === playingName ? 'on' : ''}" data-name="${esc(it.name)}" data-audio="${it.audio}">
         ${it.thumb ? `<img loading="lazy" src="/api/file?name=${encodeURIComponent(it.thumb)}">` : `<div class="ph">${it.audio ? '음원' : '영상'}</div>`}
         <div style="min-width:0"><div class="t">${esc(it.title)}</div><div class="m">${it.ext} · ${fmtSize(it.size)}</div></div>
-        <button class="ico rv" data-reveal title="폴더에서 보기">📂&#xFE0E;</button>
+        ${it.audio ? '' : '<button class="ico rv" data-edit title="편집에 추가" style="margin-left:auto">✂&#xFE0E;</button>'}
+        <button class="ico rv" data-reveal title="폴더에서 보기" ${it.audio ? '' : 'style="margin-left:0"'}>📂&#xFE0E;</button>
       </div>`).join('') : '<div class="m" style="padding:10px;color:var(--mute);font-size:12px">저장된 영상이 없습니다.</div>';
   } catch (e) { msg(e.message, true); }
 }
@@ -365,6 +382,7 @@ $('#lib').addEventListener('click', async e => {
   const it = e.target.closest('.item'); if (!it) return;
   const name = it.dataset.name;
   if (e.target.closest('[data-reveal]')) { api('/api/reveal', {name}).catch(x => msg(x.message, true)); return; }
+  if (e.target.closest('[data-edit]')) { showView('edit'); Editor.addFromLibrary(name); return; }
   playingName = name;
   const src = '/api/file?name=' + encodeURIComponent(name);
   setPlayer(it.dataset.audio === 'true' ? `<audio controls autoplay src="${src}"></audio>` : `<video controls autoplay src="${src}"></video>`);
@@ -449,5 +467,6 @@ $('#mQuit').onclick = () => { api('/api/quit', {}).finally(() => { document.body
 api('/api/settings').then(s => document.documentElement.dataset.theme = s.theme || 'dark').catch(() => {});
 fillHeights(null); syncMode(); loadLib(); pollJobs(); url.focus(); checkUpdate(false);
 </script>
+<script src="/static/editor.js"></script>
 </body>
 </html>

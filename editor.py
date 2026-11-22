@@ -62,7 +62,32 @@ def probe(path: Path, app_dir: Path) -> dict:
             "fps": round(fps, 3)}
 
 
+WAVE_RATE = 20  # 파형은 초당 20칸
+
+
+def waveform(path: Path, app_dir: Path) -> list[int]:
+    """오디오를 8kHz 모노로 풀어서 0.05초마다 가장 큰 소리 크기(0~100)를 구한다."""
+    cmd = [find_tool("ffmpeg", app_dir), "-v", "error", "-nostdin", "-i", str(path), "-vn", "-ac", "1", "-ar", "8000",
+           "-f", "s16le", "-"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, check=False, creationflags=CREATE_NO_WINDOW, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise EditError(f"파형을 만들지 못했습니다: {e}") from e
+    data = r.stdout
+    step = 8000 // WAVE_RATE * 2
+    peaks = []
+    for i in range(0, len(data) - 1, step):
+        chunk = memoryview(data[i:i + step]).cast("h")
+        peaks.append(min(100, round(max((abs(v) for v in chunk), default=0) / 327.68)))
+    return peaks
+
+
 # ---------- 편집 목록 정리 ----------
+VERSION = 2
+MAX_TRACKS = 8
+TRANS_TYPES = ("fade", "slide-l", "slide-r", "slide-u", "slide-d")  # 디졸브, 오른쪽/왼쪽/아래/위에서 밀려 들어옴
+
+
 def _num(v, default: float, lo: float, hi: float) -> float:
     try:
         x = float(v)
@@ -75,37 +100,101 @@ def _id(item: dict, prefix: str) -> str:
     return str(item.get("id") or f"{prefix}{uuid.uuid4().hex[:6]}")
 
 
+def _color(v, default: str) -> str:
+    return v if isinstance(v, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", v) else default
+
+
+def migrate(project: dict) -> dict:
+    """v1(영상 한 줄, 순서대로) 프로젝트를 v2(줄 번호 + 시작 시간)로 바꾼다. 이미 v2면 그대로."""
+    if not isinstance(project, dict):
+        return {}
+    if int(project.get("version") or 1) >= 2:
+        return project
+    p = dict(project)
+    t = 0.0
+    clips = []
+    for c in project.get("clips") or []:
+        c = dict(c)
+        c.setdefault("track", 0)
+        try:
+            sp = min(max(float(c.get("speed") or 1), 0.25), 4)
+            c["start"] = round(t, 3)
+            t += (float(c.get("out") or 0) - float(c.get("in") or 0)) / sp
+        except (TypeError, ValueError):
+            c["start"] = round(t, 3)
+        clips.append(c)
+    auds = []
+    for a in project.get("audios") or []:
+        a = dict(a)
+        a.setdefault("track", 0)
+        a["start"] = a.get("at", 0)
+        auds.append(a)
+    p.update(version=2, clips=clips, audios=auds)
+    return p
+
+
+def _tracks(raw, need: int) -> list[dict]:
+    arr = raw if isinstance(raw, list) else []
+    out = [{"mute": bool(t.get("mute")), "lock": bool(t.get("lock")), "hide": bool(t.get("hide"))}
+           for t in arr[:MAX_TRACKS] if isinstance(t, dict)]
+    while len(out) < max(need, 1):
+        out.append({"mute": False, "lock": False, "hide": False})
+    return out
+
+
 def normalize(project: dict) -> dict:
     """화면에서 온 값을 안전한 범위로 정리한다. 영상이 하나도 없으면 오류."""
+    project = migrate(project)
     out = {
-        "version": 1,
+        "version": VERSION,
         "name": BAD_NAME.sub("_", str(project.get("name") or "편집본")).strip(" .") or "편집본",
-        "clips": [], "audios": [], "subs": [], "texts": [],
+        "tracks": {}, "clips": [], "audios": [], "subs": [], "texts": [],
         "sub_style": {}, "output": {},
     }
+    raw_tr = project.get("tracks") or {}
+    vmax = amax = 0
     for c in project.get("clips") or []:
         src = str(c.get("src") or "")
         if not src:
             continue
+        track = int(_num(c.get("track"), 0, 0, MAX_TRACKS - 1))
+        vmax = max(vmax, track)
+        freeze = bool(c.get("freeze"))
         cin = _num(c.get("in"), 0, 0, 1e6)
         cout = _num(c.get("out"), cin + 1, 0, 1e6)
-        if cout - cin < 0.05:
+        if freeze:
+            cout = cin + 0.1
+        elif cout - cin < 0.05:
             raise EditError("자른 구간이 너무 짧습니다. (0.05초 이상)")
-        out["clips"].append({"id": _id(c, "c"), "src": src, "in": cin, "out": cout,
-                             "speed": _num(c.get("speed"), 1, 0.25, 4), "volume": _num(c.get("volume"), 1, 0, 4),
-                             "mute": bool(c.get("mute"))})
+        trans = c.get("trans")
+        ttype = trans.get("type") if isinstance(trans, dict) else None
+        out["clips"].append({
+            "id": _id(c, "c"), "src": src, "track": track, "start": _num(c.get("start"), 0, 0, 1e6),
+            "in": cin, "out": cout, "speed": 1.0 if freeze else _num(c.get("speed"), 1, 0.25, 4),
+            "volume": _num(c.get("volume"), 1, 0, 4), "mute": bool(c.get("mute")) or freeze,
+            "x": _num(c.get("x"), 0.5, -2, 3), "y": _num(c.get("y"), 0.5, -2, 3),
+            "scale": _num(c.get("scale"), 1, 0.05, 5), "opacity": _num(c.get("opacity"), 1, 0, 1),
+            "fade_in": _num(c.get("fade_in"), 0, 0, 60), "fade_out": _num(c.get("fade_out"), 0, 0, 60),
+            "trans": {"type": ttype} if ttype in TRANS_TYPES else None,
+            "freeze": freeze, "hold": _num(c.get("hold"), 2, 0.1, 600), "link": c.get("link") or None})
     if not out["clips"]:
         raise EditError("타임라인에 영상이 없습니다. 왼쪽 목록에서 영상을 추가하세요.")
     for a in project.get("audios") or []:
         src = str(a.get("src") or "")
         if not src:
             continue
+        track = int(_num(a.get("track"), 0, 0, MAX_TRACKS - 1))
+        amax = max(amax, track)
         end = a.get("out")
-        out["audios"].append({"id": _id(a, "a"), "src": src, "at": _num(a.get("at"), 0, 0, 1e6),
+        out["audios"].append({"id": _id(a, "a"), "src": src, "track": track,
+                              "start": _num(a.get("start", a.get("at")), 0, 0, 1e6),
                               "in": _num(a.get("in"), 0, 0, 1e6),
                               "out": None if end in (None, "", 0) else _num(end, 0, 0, 1e6),
+                              "speed": _num(a.get("speed"), 1, 0.25, 4),
                               "volume": _num(a.get("volume"), 1, 0, 4),
-                              "fade_in": _num(a.get("fade_in"), 0, 0, 60), "fade_out": _num(a.get("fade_out"), 0, 0, 60)})
+                              "fade_in": _num(a.get("fade_in"), 0, 0, 60), "fade_out": _num(a.get("fade_out"), 0, 0, 60),
+                              "link": a.get("link") or None})
+    out["tracks"] = {"v": _tracks(raw_tr.get("v"), vmax + 1), "a": _tracks(raw_tr.get("a"), amax + 1)}
     for s in project.get("subs") or []:
         text = str(s.get("text") or "").strip()
         st = _num(s.get("start"), 0, 0, 1e6)
@@ -129,16 +218,44 @@ def normalize(project: dict) -> dict:
     return out
 
 
-def _color(v, default: str) -> str:
-    return v if isinstance(v, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", v) else default
-
-
 def clip_duration(c: dict) -> float:
-    return (c["out"] - c["in"]) / c["speed"]
+    return c["hold"] if c.get("freeze") else (c["out"] - c["in"]) / c["speed"]
+
+
+def audio_duration(a: dict, src_duration: float) -> float:
+    end = a["out"] if a["out"] else src_duration
+    return max(0.05, end - a["in"]) / a["speed"]
 
 
 def total_duration(p: dict) -> float:
-    return sum(clip_duration(c) for c in p["clips"])
+    return max(c["start"] + clip_duration(c) for c in p["clips"])
+
+
+def overlap_in(p: dict, c: dict) -> float:
+    """c 가 같은 줄의 앞 클립과 겹친 길이(초). 전환이 지정된 경우에만 전환 길이가 된다."""
+    if not c.get("trans"):
+        return 0.0
+    cs, ce = c["start"], c["start"] + clip_duration(c)
+    best = 0.0
+    for o in p["clips"]:
+        if o is c or o["track"] != c["track"]:
+            continue
+        os_, oe = o["start"], o["start"] + clip_duration(o)
+        if os_ < cs < oe:
+            best = max(best, min(oe, ce) - cs)
+    return round(best, 3)
+
+
+def overlap_out(p: dict, c: dict) -> float:
+    """c 의 뒤쪽에서 다음 클립이 전환으로 덮는 길이(초)."""
+    cs, ce = c["start"], c["start"] + clip_duration(c)
+    best = 0.0
+    for d in p["clips"]:
+        if d is c or d["track"] != c["track"] or not d.get("trans"):
+            continue
+        if cs < d["start"] < ce:
+            best = max(best, min(ce, d["start"] + clip_duration(d)) - d["start"])
+    return round(best, 3)
 
 
 # ---------- SRT / ASS ----------
@@ -240,8 +357,18 @@ def atempo_chain(speed: float) -> str:
 AFMT = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo"
 
 
+def _slide(kind: str, W: int, H: int, start: float, ov: float) -> tuple[str, str]:
+    """슬라이드 전환의 가로/세로 이동량 식. 전환이 시작되면 화면 밖에서 제자리로 들어온다."""
+    prog = f"(1-clip((t-{start:.3f})/{ov:.3f},0,1))"
+    return {"slide-l": (f"+{W}*{prog}", ""), "slide-r": (f"-{W}*{prog}", ""),
+            "slide-u": ("", f"+{H}*{prog}"), "slide-d": ("", f"-{H}*{prog}")}[kind]
+
+
 def build_plan(project: dict, resolve, probe_fn) -> dict:
-    """편집 목록 -> {graph, inputs, size, duration, ass}. resolve(src)->Path, probe_fn(Path)->dict."""
+    """편집 목록 -> {graph, inputs, size, duration, ass}. resolve(src)->Path, probe_fn(Path)->dict.
+
+    검은 바탕 위에 영상 클립을 줄 번호(아래->위) 순서로 겹쳐 놓고, 소리는 모두 시간 위치에 맞춰 섞는다.
+    """
     p = normalize(project)
     inputs: list[str] = []
     infos: dict[str, dict] = {}
@@ -255,72 +382,133 @@ def build_plan(project: dict, resolve, probe_fn) -> dict:
             inputs.append(str(path))
         return index[src]
 
-    first = None
     for c in p["clips"]:
         use(c["src"])
-        if not infos[c["src"]]["has_video"]:
+        info = infos[c["src"]]
+        if not info["has_video"]:
             raise EditError(f"영상이 아닌 파일은 타임라인에 넣을 수 없습니다: {c['src']}")
-        c["out"] = min(c["out"], infos[c["src"]]["duration"] or c["out"])
-        if c["out"] - c["in"] < 0.05:
-            raise EditError("자른 구간이 영상 길이를 벗어났습니다.")
-        first = first or infos[c["src"]]
+        if c["freeze"]:
+            c["in"] = min(c["in"], max(0.0, (info["duration"] or c["in"]) - 0.1))
+            c["out"] = c["in"] + 0.1
+        else:
+            c["out"] = min(c["out"], info["duration"] or c["out"])
+            if c["out"] - c["in"] < 0.05:
+                raise EditError("자른 구간이 영상 길이를 벗어났습니다.")
+    first = infos[min(p["clips"], key=lambda c: c["start"])["src"]]
     asp = p["output"]["aspect"]
     if asp in ASPECTS:
         w, h = ASPECTS[asp]
     else:
         w, h = (first["width"] // 2 * 2) or 1280, (first["height"] // 2 * 2) or 720
     fps = int(min(60, max(15, round(first["fps"] or 30))))
+    dur = max(total_duration(p), 0.1)
+    vtr, atr = p["tracks"]["v"], p["tracks"]["a"]
 
-    g: list[str] = []
-    for n, c in enumerate(p["clips"]):
-        i, info = index[c["src"]], infos[c["src"]]
-        dur = clip_duration(c)
-        g.append(f"[{i}:v]trim=start={c['in']:.3f}:end={c['out']:.3f},setpts=(PTS-STARTPTS)/{c['speed']:.5f},"
-                 f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,"
-                 f"setsar=1,fps={fps},format=yuv420p[v{n}]")
-        if info["has_audio"] and not c["mute"]:
-            tempo = atempo_chain(c["speed"])
-            g.append(f"[{i}:a]atrim=start={c['in']:.3f}:end={c['out']:.3f},asetpts=PTS-STARTPTS,"
-                     + (tempo + "," if tempo else "") + f"volume={c['volume']:.3f},{AFMT},apad,"
-                     f"atrim=duration={dur:.3f},asetpts=PTS-STARTPTS[a{n}]")
+    g = [f"color=c=black:s={w}x{h}:r={fps}:d={dur:.3f},format=yuv420p[b0]"]
+    last = "b0"
+    layers = sorted((c for c in p["clips"] if not vtr[c["track"]]["hide"]), key=lambda c: (c["track"], c["start"]))
+    for n, c in enumerate(layers):
+        i, cd = index[c["src"]], clip_duration(c)
+        ov_in, ttype = overlap_in(p, c), (c["trans"] or {}).get("type")
+        if c["freeze"]:
+            f = (f"[{i}:v]trim=start={c['in']:.3f}:end={c['in'] + 1:.3f},setpts=PTS-STARTPTS,select='eq(n,0)',"
+                 f"tpad=stop_mode=clone:stop_duration={c['hold']:.3f},trim=duration={cd:.3f},setpts=PTS-STARTPTS")
         else:
-            g.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={dur:.3f},asetpts=PTS-STARTPTS[a{n}]")
-    n = len(p["clips"])
-    g.append("".join(f"[v{k}][a{k}]" for k in range(n)) + f"concat=n={n}:v=1:a=1[vc][ac]")
+            f = (f"[{i}:v]trim=start={c['in']:.3f}:end={c['out']:.3f},"
+                 f"setpts=(PTS-STARTPTS)/{c['speed']:.5f}")
+        sw, sh = max(2, round(w * c["scale"] / 2) * 2), max(2, round(h * c["scale"] / 2) * 2)
+        f += f",fps={fps},scale={sw}:{sh}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1"
+        fin = ov_in if ttype == "fade" and ov_in > 0 else c["fade_in"]
+        fout = c["fade_out"]
+        fades = []
+        if fin > 0:
+            fades.append(f"fade=t=in:st=0:d={min(fin, cd):.3f}:alpha=1")
+        if fout > 0:
+            fades.append(f"fade=t=out:st={max(0.0, cd - fout):.3f}:d={min(fout, cd):.3f}:alpha=1")
+        if fades or c["opacity"] < 0.999:
+            f += ",format=yuva420p" + "".join("," + x for x in fades)
+            if c["opacity"] < 0.999:
+                f += f",format=rgba,colorchannelmixer=aa={c['opacity']:.3f}"
+        else:
+            f += ",format=yuv420p"
+        f += f",setpts=PTS+{c['start']:.3f}/TB[l{n}]"
+        g.append(f)
+        dx, dy = ("", "")
+        if ttype in TRANS_TYPES and ttype != "fade" and ov_in > 0:
+            dx, dy = _slide(ttype, w, h, c["start"], ov_in)
+        x = f"W*{c['x']:.4f}-w/2{dx}"
+        y = f"H*{c['y']:.4f}-h/2{dy}"
+        g.append(f"[{last}][l{n}]overlay=x='{x}':y='{y}':eof_action=pass:"
+                 f"enable='between(t,{c['start']:.3f},{c['start'] + cd:.3f})':format=auto[b{n + 1}]")
+        last = f"b{n + 1}"
 
-    extras = []
-    for k, a in enumerate(p["audios"]):
+    # 소리: 모든 클립/오디오를 자기 시작 시간만큼 늦춰서 섞는다.
+    g.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={dur:.3f},asetpts=PTS-STARTPTS[ab]")
+    mixin = ["[ab]"]
+
+    def tail(f: str, start: float, k: int) -> None:
+        f += f",{AFMT}"
+        if start > 0:
+            f += f",adelay={round(start * 1000)}:all=1"
+        g.append(f"{f}[m{k}]")
+        mixin.append(f"[m{k}]")
+
+    k = 0
+    for c in p["clips"]:
+        info = infos[c["src"]]
+        if c["freeze"] or c["mute"] or not info["has_audio"] or atr_muted(vtr, c["track"]):
+            continue
+        cd = clip_duration(c)
+        tempo = atempo_chain(c["speed"])
+        f = (f"[{index[c['src']]}:a]atrim=start={c['in']:.3f}:end={c['out']:.3f},asetpts=PTS-STARTPTS,"
+             + (tempo + "," if tempo else "") + f"volume={c['volume']:.3f}")
+        fin = max(c["fade_in"], overlap_in(p, c))
+        fout = max(c["fade_out"], overlap_out(p, c))
+        if fin > 0:
+            f += f",afade=t=in:st=0:d={min(fin, cd):.3f}"
+        if fout > 0:
+            f += f",afade=t=out:st={max(0.0, cd - fout):.3f}:d={min(fout, cd):.3f}"
+        tail(f, c["start"], k)
+        k += 1
+    for a in p["audios"]:
         j = use(a["src"])
         if not infos[a["src"]]["has_audio"]:
             raise EditError(f"오디오가 없는 파일입니다: {a['src']}")
+        if atr[a["track"]]["mute"]:
+            continue
         end = a["out"] if a["out"] else infos[a["src"]]["duration"]
-        d = max(0.05, end - a["in"])
-        f = f"[{j}:a]atrim=start={a['in']:.3f}:end={a['in'] + d:.3f},asetpts=PTS-STARTPTS,volume={a['volume']:.3f}"
+        d_src = max(0.05, end - a["in"])
+        ad = d_src / a["speed"]
+        tempo = atempo_chain(a["speed"])
+        f = (f"[{j}:a]atrim=start={a['in']:.3f}:end={a['in'] + d_src:.3f},asetpts=PTS-STARTPTS,"
+             + (tempo + "," if tempo else "") + f"volume={a['volume']:.3f}")
         if a["fade_in"]:
-            f += f",afade=t=in:st=0:d={min(a['fade_in'], d):.3f}"
+            f += f",afade=t=in:st=0:d={min(a['fade_in'], ad):.3f}"
         if a["fade_out"]:
-            fo = min(a["fade_out"], d)
-            f += f",afade=t=out:st={d - fo:.3f}:d={fo:.3f}"
-        if a["at"] > 0:
-            f += f",adelay={round(a['at'] * 1000)}:all=1"
-        g.append(f + f",{AFMT}[x{k}]")
-        extras.append(f"[x{k}]")
-    if extras:
-        g.append("[ac]" + "".join(extras) + f"amix=inputs={len(extras) + 1}:duration=first:normalize=0,"
-                 "alimiter=limit=0.95[am]")
+            fo = min(a["fade_out"], ad)
+            f += f",afade=t=out:st={ad - fo:.3f}:d={fo:.3f}"
+        tail(f, a["start"], k)
+        k += 1
+    if k:
+        g.append("".join(mixin) + f"amix=inputs={len(mixin)}:duration=first:normalize=0,alimiter=limit=0.95[am]")
         amap = "[am]"
     else:
-        amap = "[ac]"
+        amap = "[ab]"
 
     ass = None
     if p["subs"] or p["texts"]:
         ass = build_ass(p, w, h)
-        g.append("[vc]ass=sub.ass:fontsdir=fonts[vout]")
+        g.append(f"[{last}]ass=sub.ass:fontsdir=fonts[vout]")
         vmap = "[vout]"
     else:
-        vmap = "[vc]"
-    return {"project": p, "graph": ";".join(g), "inputs": inputs, "size": (w, h), "duration": total_duration(p),
+        vmap = f"[{last}]"
+    return {"project": p, "graph": ";".join(g), "inputs": inputs, "size": (w, h), "duration": dur,
             "ass": ass, "vmap": vmap, "amap": amap}
+
+
+def atr_muted(vtr: list[dict], track: int) -> bool:
+    """영상 줄을 음소거하면 그 줄 클립의 원본 소리도 꺼진다."""
+    return bool(vtr[track]["mute"])
 
 
 def prepare_workdir(plan: dict, work: Path, app_dir: Path) -> None:
@@ -367,6 +555,7 @@ def make_router(app_dir: Path, media_dir, jobs: dict, lock: threading.Lock) -> A
     r = APIRouter(prefix="/api/edit")
     assets = app_dir / "edit_assets"
     projects = app_dir / "projects"
+    wave_cache: dict = {}
 
     def resolve(src: str) -> Path:
         if src.startswith("asset:"):
@@ -428,7 +617,16 @@ def make_router(app_dir: Path, media_dir, jobs: dict, lock: threading.Lock) -> A
         p = project_path(name)
         if not p.is_file():
             raise HTTPException(404, "프로젝트를 찾을 수 없습니다.")
-        return json.loads(p.read_text(encoding="utf-8"))
+        return migrate(json.loads(p.read_text(encoding="utf-8")))
+
+    @r.get("/wave")
+    def api_wave(src: str):
+        """소리 파형: 초당 20개의 크기(0~100) 목록."""
+        path = guard(lambda: resolve(src))
+        key = (str(path), path.stat().st_mtime)
+        if key not in wave_cache:
+            wave_cache[key] = guard(lambda: waveform(path, app_dir))
+        return {"peaks": wave_cache[key], "rate": WAVE_RATE}
 
     @r.post("/project")
     def api_project_save(body: dict):

@@ -176,3 +176,77 @@ def test_cancel_export(media, tmp_path):
     job = wait_done(jobs, jid)
     assert job["status"] in ("cancelled", "done")
     assert not list(media.glob("*.temp.mp4"))
+
+
+# ---------- v1.1: 여러 줄 / 자유 위치 / 전환 / 소리 분리 ----------
+def frame_png(video: Path, t: float, out: Path) -> Path:
+    run("-ss", t, "-i", video, "-frames:v", 1, out)
+    return out
+
+
+def test_migrate_v1_to_v2():
+    p = editor.migrate({"clips": [{"src": "a", "in": 0, "out": 2}, {"src": "b", "in": 1, "out": 4, "speed": 2}],
+                        "audios": [{"src": "m", "at": 1.5}]})
+    assert p["version"] == 2
+    assert [c["start"] for c in p["clips"]] == [0, 2]
+    assert p["audios"][0]["start"] == 1.5
+    n = editor.normalize(p)
+    assert n["clips"][1]["start"] == pytest.approx(2) and n["tracks"]["v"] and n["tracks"]["a"]
+    assert editor.migrate(n) is n
+
+
+def test_gap_and_free_position(media, tmp_path):
+    out = export(media, tmp_path, {"name": "gap", "version": 2, "clips": [
+        {"src": "a.mp4", "track": 0, "start": 0, "in": 0, "out": 1},
+        {"src": "a.mp4", "track": 0, "start": 3, "in": 1, "out": 2}]})
+    info = ffprobe_of(out)
+    assert info["duration"] == pytest.approx(4.0, abs=0.3)
+
+
+def test_overlay_layer_and_transition(media, tmp_path):
+    p = {"name": "layers", "version": 2, "clips": [
+        {"src": "a.mp4", "track": 0, "start": 0, "in": 0, "out": 4},
+        {"src": "silent.mp4", "track": 1, "start": 1, "in": 0, "out": 2, "x": 0.8, "y": 0.2, "scale": 0.4,
+         "opacity": 0.8, "fade_in": 0.3, "fade_out": 0.3},
+        {"src": "silent.mp4", "track": 0, "start": 3.5, "in": 0, "out": 2.5, "trans": {"type": "slide-l"}}]}
+    plan = editor.build_plan(p, lambda s: media / s, ffprobe_of)
+    assert plan["graph"].count("overlay=") == 3
+    out = export(media, tmp_path, p)
+    info = ffprobe_of(out)
+    assert info["duration"] == pytest.approx(6.0, abs=0.3)
+    assert info["has_audio"]
+    # 겹침이 실제로 그려졌는지: 위 레이어가 있는 구간과 없는 구간의 프레임이 달라야 한다.
+    a = frame_png(out, 0.5, tmp_path / "f0.png").read_bytes()
+    b = frame_png(out, 1.8, tmp_path / "f1.png").read_bytes()
+    assert a != b
+
+
+@pytest.mark.parametrize("kind", ["fade", "slide-r", "slide-u", "slide-d"])
+def test_transition_kinds_and_audio_overlap(media, tmp_path, kind):
+    p = {"name": "tr-" + kind, "version": 2, "clips": [
+        {"src": "a.mp4", "track": 0, "start": 0, "in": 0, "out": 3},
+        {"src": "a.mp4", "track": 0, "start": 2.5, "in": 1, "out": 4, "trans": {"type": kind}}]}
+    n = editor.normalize(p)
+    assert editor.overlap_in(n, n["clips"][1]) == pytest.approx(0.5)
+    assert editor.overlap_out(n, n["clips"][0]) == pytest.approx(0.5)
+    out = export(media, tmp_path, p)
+    assert ffprobe_of(out)["duration"] == pytest.approx(5.5, abs=0.3)
+
+
+def test_freeze_frame_detached_audio_tracks(media, tmp_path):
+    out = export(media, tmp_path, {"name": "frz", "version": 2,
+        "tracks": {"v": [{}, {"hide": True}], "a": [{}, {"mute": True}]},
+        "clips": [{"src": "a.mp4", "track": 0, "start": 0, "in": 1, "out": 2, "mute": True, "link": "L1"},
+                  {"src": "a.mp4", "track": 0, "start": 1, "in": 1.5, "out": 1.6, "freeze": True, "hold": 1.5},
+                  {"src": "a.mp4", "track": 1, "start": 0, "in": 0, "out": 2}],
+        "audios": [{"src": "a.mp4", "track": 0, "start": 0, "in": 1, "out": 2, "speed": 1, "link": "L1"},
+                   {"src": "music.wav", "track": 1, "start": 0, "in": 0, "out": 3}]})
+    info = ffprobe_of(out)
+    assert info["duration"] == pytest.approx(2.5, abs=0.3) and info["has_audio"]
+
+
+def test_waveform_api(media, tmp_path):
+    client, _ = make_client(media, tmp_path)
+    r = client.get("/api/edit/wave", params={"src": "music.wav"}).json()
+    assert r["rate"] == 20 and 110 <= len(r["peaks"]) <= 125 and max(r["peaks"]) > 10
+    assert client.get("/api/edit/wave", params={"src": "nope.wav"}).status_code == 400
